@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+out/
+*.log
+VALIDATION_NOTES.md
+NONZERO_FINDING.md
