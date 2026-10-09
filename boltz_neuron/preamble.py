@@ -8,9 +8,9 @@ Import this module (or run `python -m boltz_neuron`) BEFORE boltz builds its mod
      bf16 with dtype propagation that is safe under torch.compile.
   3. Installs the gen2 (inf2 / trn1) RNG shim so NKI's gen3-only rand_set_state is skipped.
   4. Patches the inference featurizer's max_tokens so the token axis is rounded up to the next
-     multiple of BOLTZ_NEURON_PAD (default 64) -- but ONLY when that adds at most
-     BOLTZ_NEURON_PAD_MAX_ADD tokens (default 8). Measured on inf2: N=184-191 -> 192 is
-     1.20-1.59x faster, but 208->256 / 224->256 are 8-10% SLOWER. Pad tokens are masked.
+     multiple of BOLTZ_NEURON_PAD (default 32; see the PAD comment below), and moves the two
+     token counts that do not compile (768, 896) to the next shape that does. Pad tokens are
+     masked.
   5. Drops the unused `disto_target` feature (a [N,N,1,64] fp32 training target that no
      inference module reads).
   6. Feeds `ref_space_uid % 256` so the atom encoder's same-residue mask stays exact in bf16.
@@ -23,13 +23,14 @@ Import this module (or run `python -m boltz_neuron`) BEFORE boltz builds its mod
 
 Config via env (defaults = the validated configuration); see README "Configuration":
   NEURON_PLATFORM_TARGET_OVERRIDE  (set to inf2; required before import)
-  BOLTZ_NEURON_PAD (64), BOLTZ_NEURON_PAD_MAX_ADD (8), BOLTZ_NEURON_DTYPE (bf16),
+  BOLTZ_NEURON_PAD (32), BOLTZ_NEURON_PAD_MAX_ADD (-1 = no limit), BOLTZ_NEURON_DTYPE (bf16),
+  BOLTZ_NEURON_BAD_SHAPES (768=832,896=928), BOLTZ_NEURON_WRITER_CPU (1),
   BOLTZ_NEURON_COMPILE_STRUCTURE (1), BOLTZ_NEURON_AOT_CACHE (1), BOLTZ_NEURON_PRECOMPILE (0),
   BOLTZ_NEURON_NUM_THREADS (2, precompile only), BOLTZ_NEURON_DROP_DISTO (1),
   BOLTZ_NEURON_UID_WRAP (1), BOLTZ_NEURON_STEERING (off)
 
 Validated: PyTorch Native Beta 5 (torch 2.12.1 / torch-neuronx 2.12.3 / neuronx-cc 2.27.2878
-/ nki 0.6.0) on inf2.xlarge and inf2.8xlarge.
+/ nki 0.6.0) on inf2.xlarge (runtime) and inf2.8xlarge / inf2.24xlarge (compiling).
 """
 import os
 import sys
@@ -49,20 +50,25 @@ if PRECOMPILE:
 import torch
 import torch.nn.functional as F
 
-PAD = int(os.environ.get("BOLTZ_NEURON_PAD", "64"))
+# Token-axis padding. On Inferentia2 one compiled graph in the diffusion model emits ~N*384 extra
+# DMA descriptors unless N is a multiple of 32 (measured on every N tested, 54 of 54 from 186 to
+# 1,088). Padding up to the next multiple of 32 (at most 31 masked tokens) removes them. Timed on
+# an inf2.xlarge: 186->192 1.59x, 200->224 1.16x, 330->352 1.56x, 600->608 1.26x faster; 208->224
+# and 464->480 within 2% (slightly slower). Net positive, so it is the default.
+PAD = int(os.environ.get("BOLTZ_NEURON_PAD", "32"))
 DTYPE = os.environ.get("BOLTZ_NEURON_DTYPE", "bf16")
 COMPILE_STRUCTURE = os.environ.get("BOLTZ_NEURON_COMPILE_STRUCTURE", "1") not in ("0", "false", "no")
 STEERING = os.environ.get("BOLTZ_NEURON_STEERING", "off") in ("on", "1", "true")
-PAD_MAX_ADD = int(os.environ.get("BOLTZ_NEURON_PAD_MAX_ADD", "8"))
+PAD_MAX_ADD = int(os.environ.get("BOLTZ_NEURON_PAD_MAX_ADD", "-1"))
 
 # WORKAROUND(trimul-shape): token counts at which the trunk's triangle-multiplication matmul
 # ([128,N,N] x [128,N,N] bf16, with its slice+transpose prologue) exceeds neuronx-cc's 5M
 # instruction limit (NCC_EBVF030) on inf2. Measured with the op alone, N = 640..1088 step 32:
 # only 768 (18.9M instructions) and 896 (25.7M) fail; every other N compiles on a smooth curve.
 # These are shape-specific code-generation blow-ups, not a size limit. Inputs that land on one are
-# padded to the next shape that compiles. Validated on two real ~765-residue proteins (768 -> 832):
-# same accuracy as the BOLTZ_TRIMUL_KCHUNK fallback (0.15-0.21 A apart, below the 0.33-0.61 A
-# seed-to-seed spread) and 1.53x faster. 896 -> 928 follows the same rule (compile verified).
+# padded to the next shape that compiles. Validated on real proteins against the BOLTZ_TRIMUL_KCHUNK
+# fallback: 768 -> 832 (two ~765-residue proteins, 0.15-0.21 A apart, 1.53x faster) and 896 -> 928
+# (two ~890-residue proteins, 0.13-0.20 A apart; seed-to-seed spread is larger in both cases).
 # Remove when the compiler handles these shapes. Override with BOLTZ_NEURON_BAD_SHAPES="" (off) or
 # a comma list of bad=good pairs.
 _BAD_SHAPES_DEFAULT = "768=832,896=928"

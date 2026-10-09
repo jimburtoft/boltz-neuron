@@ -13,6 +13,7 @@ the rest when it starts. None of these change Boltz-2's model code or weights.
 | `torch.nonzero` count | setup | `BOOL_SUM_SHIM` | on Inferentia2 the count can come out too small at some lengths |
 | gen2 RNG | setup + package | `GEN2_SHIM` | device RNG seeding requires a newer NeuronCore; not needed for inference |
 | outputs unpadded on CPU | package | `WORKAROUND(nonzero-index)` | on-device boolean indexing can return wrong indices at some lengths |
+| tokens padded to a multiple of 32 | package | `BOLTZ_NEURON_PAD` | other token counts make one graph do ~N x 384 extra DMA transfers |
 | 768 / 896 tokens padded to 832 / 928 | package | `WORKAROUND(trimul-shape)` | the compiler cannot handle these two sizes |
 | residue ids mod 256 | package | `BOLTZ_NEURON_UID_WRAP` | keeps an atom-to-residue mask exact in bf16 above 256 residues |
 | Lightning accelerator | package | `NeuronAccelerator` | Lightning has no Neuron device; the package registers one |
@@ -30,5 +31,7 @@ column. Each fix is meant to be removed once the underlying Neuron issue is fixe
 - **`--max_parallel_samples` in Boltz 2.2.1 is a chunk count, not a cap.** The default (5) runs
   `--diffusion_samples 8` as 4 chunks of 2; the package leaves it alone (no measurable cost).
   `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1` makes it a cap, which helps large inputs with many samples fit.
-- **Large inputs:** up to 1,088 tokens per chip; cap `--max_msa_seqs` (4096) above ~700 tokens with
-  deep MSAs.
+- **Large inputs:** up to 1,088 tokens per chip; use `--max_msa_seqs 2048` above ~700 tokens.
+- **Ligands / complexes and fk_steering are not validated.** The confidence head and the steering
+  potentials do boolean indexing on device, which the `nonzero-index` issue can corrupt at some atom
+  counts (protein-only inference does not reach it).

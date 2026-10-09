@@ -58,38 +58,40 @@ protein chains without MSA, warm (already compiled). `ds` = `--diffusion_samples
 
 ### Latency: seconds per prediction, one NeuronCore
 
-| tokens | ds=1 | ds=8 | ds=25 | ds=50 |
-|---:|---:|---:|---:|---:|
-| 64 | 4.6 | 6.1 | 10.9 | 16.1 |
-| 128 | 6.1 | 8.3 | 15.8 | 25.4 |
-| 186 | 11.0 | 16.1 | 30.9 | 51.9 |
-| 256 | 15.1 | 21.2 | 45.3 | 69.5 |
-| 384 | 27.6 | 41.3 | 73.1 | 110.2 |
-| 512 | 65 | 85 | 152 | |
-| 640 | 101 | 134 | 223 * | |
-| 768 | 195 | | | |
-| 1,024 | 339 | 514 | | |
-| 1,088 | 385 | | | |
+| tokens | ds=1 | ds=8 | ds=25 |
+|---:|---:|---:|---:|
+| 64 | 5.1 | 8.3 | 12.0 |
+| 128 | 6.2 | 10.5 | 16.1 |
+| 192 | 11.3 | 17.8 | 32.6 |
+| 256 | 15.3 | 23.7 | 47.7 |
+| 384 | 27.9 | 39.7 | 75.3 |
+| 512 | 63.8 | 85.3 | 151.5 |
+| 640 | 99.9 | 133.2 | 223.7 * |
+| 1,024 | 334.8 | 495.7 | |
+| 1,088 | 375.2 | | |
 
 ### Throughput: structures per second per Inferentia2 chip (one worker on each of the 2 cores)
 
-| tokens | ds=1 | ds=8 | ds=25 | ds=50 |
-|---:|---:|---:|---:|---:|
-| 64 | 0.395 | 2.28 | 4.07 | 5.82 |
-| 128 | 0.330 | 1.76 | 3.18 | 3.86 |
-| 186 | 0.180 | 0.99 | 1.61 | 1.89 |
-| 256 | 0.133 | 0.74 | 1.07 | 1.40 |
-| 384 | 0.072 | 0.39 | 0.68 | 0.90 |
-| 512 | 0.031 | 0.18 | 0.33 | |
-| 640 | 0.020 | 0.12 | 0.22 * | |
-| 1,024 | 0.006 | 0.03 | | |
+| tokens | ds=1 | ds=8 | ds=25 |
+|---:|---:|---:|---:|
+| 64 | 0.340 | 1.36 | 3.25 |
+| 128 | 0.235 | 1.19 | 2.60 |
+| 192 | 0.151 | 0.79 | 1.42 |
+| 256 | 0.118 | 0.61 | 0.99 |
+| 384 | 0.068 | 0.38 | 0.64 |
+| 512 | 0.031 | 0.18 | 0.32 |
+| 640 | 0.020 | 0.12 | 0.22 * |
+| 1,024 | 0.006 | 0.03 | |
+| 1,088 | 0.005 | | |
 
 \* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1` (runs the samples in smaller groups to fit).
 
-Run one worker per NeuronCore (`NEURON_RT_VISIBLE_CORES=0` and `=1`). inf2.xlarge gives 90-95% of
-these figures (fewer host CPUs). Up to 384 tokens: measured with a harness that calls the model
-directly; 512 and up: measured through the command line, which adds 10-20% at small sizes. One call
-with `--diffusion_samples 25` is far cheaper than 25 calls with `--diffusion_samples 1`.
+All measured on an **inf2.xlarge**: warm model time per prediction (median of 3 after 1 warm-up)
+in one `predict` process, and for throughput one worker per NeuronCore
+(`NEURON_RT_VISIBLE_CORES=0` and `=1`) running at the same time. The 192-token row is the
+186-residue example padded to 192. At 1,024 tokens and above two workers fit in device memory but
+need most of the xlarge's 15 GB host RAM. One call with `--diffusion_samples 25` is far cheaper than
+25 calls with `--diffusion_samples 1`.
 
 ### Command-line time per input (inf2.xlarge, 186-token example)
 
@@ -106,11 +108,15 @@ To process many inputs, pass a **directory** to one command: startup is paid onc
 ## Input size and padding
 
 - **Largest input: 1,088 tokens per chip.** More diffusion samples lower that (at 1,024 tokens, ds=8
-  fits and ds=25 does not). With large MSAs, start with `--max_msa_seqs 4096` above ~700 tokens.
-- **Padding.** Speed depends on exact length: sizes that are a multiple of 64 run up to 1.6x faster.
-  The package pads an input to the next multiple of 64 when that adds at most 8 tokens. It also pads
-  768 and 896 tokens (sizes the compiler cannot handle) to 832 and 928. Pad tokens are masked; padded
-  predictions match unpadded ones within the model's seed-to-seed variation.
+  fits and ds=25 does not).
+- **Cap the MSA above ~700 tokens.** The loaded MSA uses device memory: at ~890 residues, 8,192 MSA
+  sequences fail, 4,096 fail on some runs, and 2,048 runs reliably with unchanged accuracy (Boltz-2
+  uses 1,024 MSA rows inside the model by default). Use `--max_msa_seqs 2048`.
+- **Padding.** On Inferentia2, token counts that are not a multiple of 32 run up to 1.6x slower (one
+  compiled graph does far more data movement). The package pads every input to the next multiple of
+  32, and pads 768 and 896 tokens (sizes the compiler cannot handle) to 832 and 928. Pad tokens are
+  masked; padded predictions match unpadded ones within the model's seed-to-seed variation, checked
+  on real proteins at ~190, ~765 and ~890 residues.
 
 ## Accuracy
 
@@ -159,8 +165,8 @@ Environment variables; the defaults are the validated configuration.
 | variable | default | meaning |
 |-----|---------|---------|
 | `NEURON_PLATFORM_TARGET_OVERRIDE` | none | **set to `inf2`** |
-| `BOLTZ_NEURON_PAD` | `64` | pad target multiple (`0` or `1` disables padding) |
-| `BOLTZ_NEURON_PAD_MAX_ADD` | `8` | pad only if it adds at most this many tokens (`-1` = always) |
+| `BOLTZ_NEURON_PAD` | `32` | pad the token count to a multiple of this (`0` or `1` disables padding) |
+| `BOLTZ_NEURON_PAD_MAX_ADD` | `-1` | pad only if it adds at most this many tokens (`-1` = no limit) |
 | `BOLTZ_NEURON_BAD_SHAPES` | `768=832,896=928` | token counts the compiler cannot handle, and their replacement (`""` disables) |
 | `BOLTZ_NEURON_DTYPE` | `bf16` | `fp32` disables bf16 |
 | `BOLTZ_NEURON_COMPILE_STRUCTURE` | `1` | `0` disables compiling the diffusion model |
