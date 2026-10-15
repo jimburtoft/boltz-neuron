@@ -15,31 +15,26 @@ protein chains of 64-1,088 tokens.
 
 - An inf2 instance running the AWS **Deep Learning AMI Neuron (Ubuntu 24.04)**, SDK 2.32
   (`20260818`).
-- Access to the **PyTorch Native Beta 5** container in Amazon ECR
-  (`421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b`). `setup_inf2.sh`
-  installs its Python stack (torch 2.12.1, torch-neuronx 2.12.3, neuronx-cc 2.27.2878, nki 0.6.0)
-  into a local venv.
+- The **PyTorch Native** container image. Set `NEURON_PTN_IMAGE` to its URI before running
+  `setup_inf2.sh`; the script installs the image's Python stack (torch 2.12.1, torch-neuronx 2.12.3,
+  neuronx-cc 2.27.2878, nki 0.6.0) into a local venv.
 
 ## Quick start (inf2.xlarge)
 
 ```bash
-# 1. From a machine with AWS credentials, let the instance pull the PyTorch Native container:
-TOKEN=$(aws ecr get-login-password --region us-east-1)
-ssh <instance> "echo '$TOKEN' | sudo docker login --username AWS \
-    --password-stdin 421672808698.dkr.ecr.us-east-1.amazonaws.com"
-
-# 2. On the instance: install (about 20 minutes)
+# 1. On the instance: install (about 20 minutes)
 git clone https://github.com/jimburtoft/boltz-neuron.git && cd boltz-neuron
+export NEURON_PTN_IMAGE=<PyTorch Native image URI>
 bash scripts/setup_inf2.sh
 
-# 3. Restore the prebuilt cache, so the example runs without compiling
+# 2. Restore the prebuilt cache, so the example runs without compiling
 source ~/boltz_neuron_ws/workspace/venv/bin/activate
 pip install -q huggingface_hub
 hf download jburtoft/boltz-neuron-cache boltz_neuron_cache_v7_ds1-8-25.tgz \
     --repo-type dataset --local-dir ~/
 bash scripts/restore_cache.sh ~/boltz_neuron_cache_v7_ds1-8-25.tgz
 
-# 4. Predict (same arguments as `boltz predict`)
+# 3. Predict (same arguments as `boltz predict`)
 export NEURON_PLATFORM_TARGET_OVERRIDE=inf2 NEURON_RT_VISIBLE_CORES=0 NEURON_SCRATCHPAD_PAGE_SIZE=2048
 python -m boltz_neuron predict examples/8eil.yaml --out_dir out \
     --recycling_steps 3 --sampling_steps 50 --diffusion_samples 1 --num_workers 0

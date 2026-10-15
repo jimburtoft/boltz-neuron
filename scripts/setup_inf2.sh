@@ -1,22 +1,16 @@
 #!/bin/bash
 # boltz-neuron setup for AWS Inferentia2 (inf2).
 #
-# Installs the PyTorch Native Beta 5 stack + Boltz-2 v2.2.1 into ~/boltz_neuron_ws/workspace/venv,
+# Installs the PyTorch Native stack + Boltz-2 v2.2.1 into ~/boltz_neuron_ws/workspace/venv,
 # applies the Inferentia2 fixes listed in NOTES.md, and installs the boltz_neuron package.
 # Takes about 20 minutes.
 #
 # Tested host: AWS Deep Learning AMI Neuron (Ubuntu 24.04) SDK 2.32 (20260818) on inf2.xlarge and
 # inf2.8xlarge.
-# Prereq (run from a machine with AWS credentials BEFORE this script, so the instance can pull
-# the container):
-#   TOKEN=$(aws ecr get-login-password --region us-east-1)
-#   ssh <instance> "echo '$TOKEN' | sudo docker login --username AWS --password-stdin \
-#        421672808698.dkr.ecr.us-east-1.amazonaws.com"
+# Prereq: export NEURON_PTN_IMAGE=<PyTorch Native image URI>[@sha256:... or :tag]
 set -e
 
-REPO="421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b"
-# PyTorch Native Beta 5 (SDK 2.32-era): torch 2.12.1, torch-neuronx 2.12.3, neuronx-cc 2.27.2878, nki 0.6.0
-BETA_DIGEST="${BOLTZ_BETA_DIGEST:-sha256:94413ce1ffea3d45757fa8b65dafac6b302a613e82b1e49fd99d3c70e1dffa8b}"
+REPO="${NEURON_PTN_IMAGE:?set NEURON_PTN_IMAGE to the PyTorch Native image URI}"
 WS="$HOME/boltz_neuron_ws"
 PKG_DIR="$(cd "$(dirname "$0")/.." && pwd)"   # repo root (has boltz_neuron/)
 
@@ -29,9 +23,9 @@ if ! swapon --show | grep -q /swapfile; then
   sudo chmod 600 /swapfile; sudo mkswap --force /swapfile; sudo swapon /swapfile
 fi
 
-echo "=== [3/6] Pull Beta 5 container + extract /workspace ==="
-sudo docker pull "${REPO}@${BETA_DIGEST}"
-IMG=$(sudo docker images -q --filter reference=$REPO | head -1)
+echo "=== [3/6] Pull the PyTorch Native container + extract /workspace ==="
+sudo docker pull "${REPO}"
+IMG=$(sudo docker images -q --filter reference="${REPO%%[@:]*}" | head -1)
 if [ ! -d "$WS/workspace" ]; then
   mkdir -p "$WS"
   CID=$(sudo docker create $IMG)
@@ -40,7 +34,7 @@ if [ ! -d "$WS/workspace" ]; then
   sudo chown -R "$(id -u):$(id -g)" "$WS/workspace"
 fi
 
-echo "=== [4/6] Host runtime debs (match Beta 5) ==="
+echo "=== [4/6] Host runtime debs (match the container) ==="
 sudo dpkg -i "$WS"/workspace/runtime_artifacts/*.deb 2>/dev/null || \
   sudo dpkg -i --force-overwrite "$WS"/workspace/runtime_artifacts/*.deb || true
 
