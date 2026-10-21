@@ -16,7 +16,7 @@
 # replaces an earlier one's package.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-VENV="$HOME/boltz_neuron_ws/workspace/venv"
+VENV="${BOLTZ_NEURON_VENV:-/opt/aws_neuronx_venv_torch_neuronx_2_14_0}"
 INPUT="${1:-$REPO/examples/8eil.yaml}"
 DS_LIST="${2:-1,8,25}"
 CACHE="/tmp/neff_cache"
@@ -24,7 +24,7 @@ OUT="$HOME/boltz_neuron_cache.tgz"
 ARGS="--recycling_steps 3 --sampling_steps 50 --num_workers 0 --override"
 
 source "$VENV/bin/activate"
-export NEURON_PLATFORM_TARGET_OVERRIDE=inf2 NEURON_RT_VISIBLE_CORES=0 NEURON_SCRATCHPAD_PAGE_SIZE=2048
+export NEURON_RT_VISIBLE_CORES=0
 
 echo "=== compiling $INPUT for diffusion_samples in {$DS_LIST} (first run per shape takes minutes) ==="
 for ds in ${DS_LIST//,/ }; do
@@ -32,13 +32,15 @@ for ds in ${DS_LIST//,/ }; do
     > "/tmp/warm_ds$ds.log" 2>&1 && echo "  ds=$ds compiled OK" || { echo "  ds=$ds FAILED"; tail -5 "/tmp/warm_ds$ds.log"; }
 done
 
-# Record the dynamo precompile package for the same shapes (used only with BOLTZ_NEURON_PRECOMPILE=1).
-# A shape's first precompile run is slower than a normal run, so it is done here, not in production.
-echo "=== recording the dynamo precompile package ==="
-for ds in ${DS_LIST//,/ }; do
-  BOLTZ_NEURON_PRECOMPILE=1 python -m boltz_neuron predict "$INPUT" --out_dir "/tmp/warm_pc_ds$ds" $ARGS --diffusion_samples "$ds" \
-    > "/tmp/warm_pc_ds$ds.log" 2>&1 && echo "  ds=$ds precompile OK" || { echo "  ds=$ds precompile FAILED"; tail -5 "/tmp/warm_pc_ds$ds.log"; }
-done
+# Dynamo precompile package (BOLTZ_NEURON_PRECOMPILE=1): does not load on torch 2.14 / SDK 2.33 (guard
+# rebuild fails with "IndexError: list index out of range"), so it is only recorded on request.
+if [ "${BOLTZ_NEURON_BUILD_PRECOMPILE:-0}" = 1 ]; then
+  echo "=== recording the dynamo precompile package ==="
+  for ds in ${DS_LIST//,/ }; do
+    BOLTZ_NEURON_PRECOMPILE=1 python -m boltz_neuron predict "$INPUT" --out_dir "/tmp/warm_pc_ds$ds" $ARGS --diffusion_samples "$ds" \
+      > "/tmp/warm_pc_ds$ds.log" 2>&1 && echo "  ds=$ds precompile OK" || { echo "  ds=$ds precompile FAILED"; tail -5 "/tmp/warm_pc_ds$ds.log"; }
+  done
+fi
 
 echo "=== packaging -> $OUT ==="
 if [ ! -d "$CACHE" ]; then

@@ -6,7 +6,7 @@ Import this module (or run `python -m boltz_neuron`) BEFORE boltz builds its mod
   1. Patches torch.load for the Boltz checkpoint (weights_only=False + omegaconf allowlist).
   2. Applies the bf16 patch set (patches.apply_patches / apply_load_patches) so Boltz runs in
      bf16 with dtype propagation that is safe under torch.compile.
-  3. Installs the gen2 (inf2 / trn1) RNG shim so NKI's gen3-only rand_set_state is skipped.
+  3. Installs the Inferentia2 RNG workaround (random tensors drawn on CPU; see WORKAROUND(gen2-rng)).
   4. Patches the inference featurizer's max_tokens so the token axis is rounded up to the next
      multiple of BOLTZ_NEURON_PAD (default 32; see the PAD comment below), and moves the two
      token counts that do not compile (768, 896) to the next shape that does. Pad tokens are
@@ -22,15 +22,16 @@ Import this module (or run `python -m boltz_neuron`) BEFORE boltz builds its mod
        - cast to bf16 and moved to the neuron device.
 
 Config via env (defaults = the validated configuration); see README "Configuration":
-  NEURON_PLATFORM_TARGET_OVERRIDE  (set to inf2; required before import)
+  NEURON_PLATFORM_TARGET_OVERRIDE  (SDK 2.33: leave unset; Beta 5: set to inf2 before import)
   BOLTZ_NEURON_PAD (32), BOLTZ_NEURON_PAD_MAX_ADD (-1 = no limit), BOLTZ_NEURON_DTYPE (bf16),
   BOLTZ_NEURON_BAD_SHAPES (768=832,896=928), BOLTZ_NEURON_WRITER_CPU (1),
   BOLTZ_NEURON_COMPILE_STRUCTURE (1), BOLTZ_NEURON_AOT_CACHE (1), BOLTZ_NEURON_PRECOMPILE (0),
   BOLTZ_NEURON_NUM_THREADS (2, precompile only), BOLTZ_NEURON_DROP_DISTO (1),
   BOLTZ_NEURON_UID_WRAP (1), BOLTZ_NEURON_STEERING (off)
 
-Validated: PyTorch Native Beta 5 (torch 2.12.1 / torch-neuronx 2.12.3 / neuronx-cc 2.27.2878
-/ nki 0.6.0) on inf2.xlarge (runtime) and inf2.8xlarge / inf2.24xlarge (compiling).
+Validated: Neuron SDK 2.33 torch-neuronx DLAMI (torch 2.14.0 / torch-neuronx 2.14.3 / neuronx-cc
+2.28.7631 / nki 0.7.0) on inf2.xlarge (runtime) and inf2.8xlarge / inf2.24xlarge (compiling).
+Earlier: PyTorch Native Beta 5 (torch 2.12.1 / torch-neuronx 2.12.3 / neuronx-cc 2.27.2878).
 """
 import os
 import sys
@@ -46,6 +47,30 @@ if _HERE not in sys.path:
 PRECOMPILE = os.environ.get("BOLTZ_NEURON_PRECOMPILE", "0") in ("1", "true", "on")
 if PRECOMPILE:
     os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
+
+
+def _torch_neuronx_version():
+    try:
+        from importlib.metadata import version
+        return tuple(int(x) for x in version("torch-neuronx").split(".")[:2])
+    except Exception:
+        return (0, 0)
+
+
+# Neuron SDK 2.33 (torch-neuronx 2.14) on Inferentia2. Both settings are read once, when torch_neuronx
+# loads, so they are made here, before torch is imported:
+#  - int64 tensors: the default "native" mode passes int64 to the compiler as 64-bit integers, and on
+#    Inferentia2 some eager int64 ops then return wrong values (e.g. torch.where on a [1,64,64] int64
+#    tensor; Boltz-2's relative-position one_hot fails with "Class values must be non-negative").
+#    "packed" mode computes on the low 32 bits, which holds every int64 value Boltz-2 uses.
+#  - NEURON_PLATFORM_TARGET_OVERRIDE=inf2 is not needed (the runtime reports inf2 as "trn1"), and with
+#    it set torch-neuronx 2.14 selects the NeuronCore-v3 RNG kernel, which asserts on Inferentia2.
+os.environ.setdefault("NEURON_SCRATCHPAD_PAGE_SIZE", "2048")
+_TNX = _torch_neuronx_version()
+if _TNX >= (2, 14):
+    os.environ.setdefault("TORCH_NEURONX_INT64_MODE", "packed")
+    if os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE", "").lower() in ("inf2", "trn1", "gen2"):
+        os.environ.pop("NEURON_PLATFORM_TARGET_OVERRIDE")
 
 import torch
 import torch.nn.functional as F
@@ -86,15 +111,52 @@ def _log(msg):
 
 
 def _install_gen2_rng_shim():
-    """NKI rand_set_state hard-asserts NeuronCore-v3+; neutralize it on gen2 (inf2/trn1)."""
-    if not any(g in TARGET.lower() for g in ("inf2", "trn1", "gen2")):
-        return
+    """Random numbers on Inferentia2 (NeuronCore-v2).
+
+    torch-neuronx's on-device RNG is an NKI kernel that needs NeuronCore-v3+. On inf2 the SDK 2.33
+    release disables it (`_has_nki_rng = False`), and its fallback for an eager
+    `torch.randn(..., device="neuron")` calls `torch.rand` on the device again, which recurses until
+    Python's limit (the first symptom is an "Out of bounds access" NEFF error or a garbage tensor).
+    Boltz-2 draws its diffusion noise in the eager sampler loop, so draw it on the CPU and copy it
+    to the device: the same numbers for a given --seed, and no device RNG needed.
+    WORKAROUND(gen2-rng). Remove when torch-neuronx has a working gen2 RNG fallback.
+    """
     try:
         from torch_neuronx.python_ops.nki_kernels import rng_state as _rs
-        _rs.set_rng_state = lambda *a, **k: None
-        _log(f"gen2 RNG shim installed (target={TARGET})")
     except Exception as e:
         _log(f"gen2 RNG shim skipped: {e!r}")
+        return
+    if getattr(_rs, "_has_nki_rng", True):
+        if any(g in TARGET.lower() for g in ("inf2", "trn1", "gen2")):
+            # Older builds (PyTorch Native Beta 5) with the target override: the kernel exists but
+            # rand_set_state asserts on gen2. Seeding is not needed for inference.
+            _rs.set_rng_state = lambda *a, **k: None
+            _log(f"gen2 RNG shim installed (set_rng_state disabled, target={TARGET})")
+        return
+
+    def _is_neuron(d):
+        return d is not None and torch.device(d).type == "neuron"
+
+    def _factory(orig):
+        def f(*a, device=None, **k):
+            if _is_neuron(device) and not torch.compiler.is_compiling():
+                return orig(*a, device="cpu", **k).to(device)
+            return orig(*a, device=device, **k)
+        return f
+
+    def _like(orig):
+        def f(x, *a, device=None, **k):
+            dev = device if device is not None else x.device
+            if _is_neuron(dev) and not torch.compiler.is_compiling():
+                return orig(x, *a, device="cpu", **k).to(dev)
+            return orig(x, *a, device=device, **k)
+        return f
+
+    for name in ("randn", "rand", "randint"):
+        setattr(torch, name, _factory(getattr(torch, name)))
+    for name in ("randn_like", "rand_like"):
+        setattr(torch, name, _like(getattr(torch, name)))
+    _log("gen2 RNG shim installed (random tensors drawn on CPU, then moved to the device)")
 
 
 def _install_pad_hook():

@@ -17,8 +17,8 @@ if [ -d /tmp/aot_bundle ]; then
 fi
 echo ""
 echo "Predict:"
-echo "  source \$HOME/boltz_neuron_ws/workspace/venv/bin/activate"
-echo "  export NEURON_PLATFORM_TARGET_OVERRIDE=inf2 NEURON_RT_VISIBLE_CORES=0 NEURON_SCRATCHPAD_PAGE_SIZE=2048"
+echo "  source /opt/aws_neuronx_venv_torch_neuronx_2_14_0/bin/activate"
+echo "  export NEURON_RT_VISIBLE_CORES=0"
 echo "  python -m boltz_neuron predict input.yaml --out_dir out --recycling_steps 3 --sampling_steps 50 --diffusion_samples 1 --num_workers 0"
 echo ""
 echo "A shape that is not in the cache compiles on first use; an inf2.xlarge does not have enough"

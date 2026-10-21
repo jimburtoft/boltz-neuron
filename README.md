@@ -8,37 +8,48 @@ applies a validated configuration automatically when you run `python -m boltz_ne
 inference, a compiled diffusion model, sequence-length padding to fast shapes, caches that survive
 restarts, and the Inferentia2 fixes described in [NOTES.md](NOTES.md).
 
-Validated on **inf2.xlarge** and **inf2.8xlarge** (one Inferentia2 chip, two NeuronCores) for single
-protein chains of 64-1,088 tokens.
+Runs on the public **AWS Neuron SDK 2.33** torch-neuronx DLAMI; no containers or private
+packages. Validated on **inf2.xlarge** and **inf2.8xlarge** (one Inferentia2 chip, two NeuronCores)
+for single protein chains of 64-1,056 tokens. (PyTorch Native is officially supported on Trainium2/3;
+Inferentia2 works with the fixes in [NOTES.md](NOTES.md) but is not an AWS-supported target.)
 
 ## Requirements
 
-- An inf2 instance running the AWS **Deep Learning AMI Neuron (Ubuntu 24.04)**, SDK 2.32
-  (`20260818`).
-- The **PyTorch Native** container image. Set `NEURON_PTN_IMAGE` to its URI before running
-  `setup_inf2.sh`; the script installs the image's Python stack (torch 2.12.1, torch-neuronx 2.12.3,
-  neuronx-cc 2.27.2878, nki 0.6.0) into a local venv.
+- An inf2 instance (inf2.xlarge to run, inf2.8xlarge or larger to compile new shapes) launched from
+  **Deep Learning AMI Neuron torch-neuronx 2.14.0 (Ubuntu 24.04) SDK 2.33.0** (or the SDK 2.33
+  multi-framework DLAMI). Look up the AMI ID for your region with:
+
+  ```bash
+  aws ssm get-parameter --region <region> \
+      --name /aws/service/neuron/dlami/torch-neuronx-2.14.0/ubuntu-24.04/latest/image_id \
+      --query Parameter.Value --output text
+  ```
+
+  The package uses the DLAMI's venv as is (`/opt/aws_neuronx_venv_torch_neuronx_2_14_0`: torch
+  2.14.0, torch-neuronx 2.14.3, neuronx-cc 2.28.7631, nki 0.7.0) and adds Boltz-2 to it.
+- A root volume of at least 100 GB (300 GB on the compile host).
 
 ## Quick start (inf2.xlarge)
 
 ```bash
-# 1. On the instance: install (about 20 minutes)
+# 1. Install (about 3 minutes)
 git clone https://github.com/jimburtoft/boltz-neuron.git && cd boltz-neuron
-export NEURON_PTN_IMAGE=<PyTorch Native image URI>
 bash scripts/setup_inf2.sh
 
 # 2. Restore the prebuilt cache, so the example runs without compiling
-source ~/boltz_neuron_ws/workspace/venv/bin/activate
-pip install -q huggingface_hub
-hf download jburtoft/boltz-neuron-cache boltz_neuron_cache_v7_ds1-8-25.tgz \
+source /opt/aws_neuronx_venv_torch_neuronx_2_14_0/bin/activate
+hf download jburtoft/boltz-neuron-cache boltz_neuron_cache_v8_sdk233_ds1-8-25.tgz \
     --repo-type dataset --local-dir ~/
-bash scripts/restore_cache.sh ~/boltz_neuron_cache_v7_ds1-8-25.tgz
+bash scripts/restore_cache.sh ~/boltz_neuron_cache_v8_sdk233_ds1-8-25.tgz
 
 # 3. Predict (same arguments as `boltz predict`)
-export NEURON_PLATFORM_TARGET_OVERRIDE=inf2 NEURON_RT_VISIBLE_CORES=0 NEURON_SCRATCHPAD_PAGE_SIZE=2048
+export NEURON_RT_VISIBLE_CORES=0
 python -m boltz_neuron predict examples/8eil.yaml --out_dir out \
     --recycling_steps 3 --sampling_steps 50 --diffusion_samples 1 --num_workers 0
 ```
+
+Do not set `NEURON_PLATFORM_TARGET_OVERRIDE` (earlier versions of this package needed `inf2`; on SDK
+2.33 the package removes it, see NOTES.md).
 
 The output is a standard Boltz-2 mmCIF structure plus confidence files in `out/`.
 
@@ -48,65 +59,66 @@ Other inputs compile on their first run, which needs more host RAM than an inf2.
 
 ## Performance
 
-PyTorch Native Beta 5, bf16, `--recycling_steps 3 --sampling_steps 50`, fk_steering off, single
-protein chains without MSA, warm (already compiled). `ds` = `--diffusion_samples`.
+Neuron SDK 2.33 (torch-neuronx 2.14.3), bf16, `--recycling_steps 3 --sampling_steps 50`, fk_steering
+off, single protein chains without MSA, warm (already compiled). `ds` = `--diffusion_samples`.
 
 ### Latency: seconds per prediction, one NeuronCore
 
 | tokens | ds=1 | ds=8 | ds=25 |
 |---:|---:|---:|---:|
-| 64 | 5.1 | 8.3 | 12.0 |
-| 128 | 6.2 | 10.5 | 16.1 |
-| 192 | 11.3 | 17.8 | 32.6 |
-| 256 | 15.3 | 23.7 | 47.7 |
-| 384 | 27.9 | 39.7 | 75.3 |
-| 512 | 63.8 | 85.3 | 151.5 |
-| 640 | 99.9 | 133.2 | 223.7 * |
-| 1,024 | 334.8 | 495.7 | |
-| 1,088 | 375.2 | | |
+| 64 | 4.4 | 7.0 | 11.2 |
+| 128 | 5.8 | 9.3 | 15.5 |
+| 192 | 10.6 | 16.3 | 30.3 |
+| 256 | 15.0 | 22.3 | 44.3 |
+| 384 | 28.2 | 39.6 | 75.7 |
+| 512 | 62.8 | 83.4 | 144.7 |
+| 640 | 103.0 | 139.6 | 230.5 * |
+| 960 | 261.7 | 346.6 | |
+| 1,024 | 347.8 | | |
+| 1,056 | 370.4 | | |
 
 ### Throughput: structures per second per Inferentia2 chip (one worker on each of the 2 cores)
 
 | tokens | ds=1 | ds=8 | ds=25 |
 |---:|---:|---:|---:|
-| 64 | 0.340 | 1.36 | 3.25 |
-| 128 | 0.235 | 1.19 | 2.60 |
-| 192 | 0.151 | 0.79 | 1.42 |
-| 256 | 0.118 | 0.61 | 0.99 |
-| 384 | 0.068 | 0.38 | 0.64 |
-| 512 | 0.031 | 0.18 | 0.32 |
-| 640 | 0.020 | 0.12 | 0.22 * |
-| 1,024 | 0.006 | 0.03 | |
-| 1,088 | 0.005 | | |
+| 64 | 0.344 | 1.65 | 3.54 |
+| 128 | 0.276 | 1.34 | 2.74 |
+| 192 | 0.168 | 0.89 | 1.57 |
+| 256 | 0.127 | 0.68 | 1.10 |
+| 384 | 0.069 | 0.39 | 0.65 |
+| 512 | 0.032 | 0.19 | 0.34 |
+| 640 | 0.019 | 0.11 | 0.21 * |
+| 960 | 0.008 | 0.046 | |
+| 1,024 | 0.006 | | |
+| 1,056 | 0.005 | | |
 
 \* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1` (runs the samples in smaller groups to fit).
 
 All measured on an **inf2.xlarge**: warm model time per prediction (median of 3 after 1 warm-up)
 in one `predict` process, and for throughput one worker per NeuronCore
 (`NEURON_RT_VISIBLE_CORES=0` and `=1`) running at the same time. The 192-token row is the
-186-residue example padded to 192. At 1,024 tokens and above two workers fit in device memory but
-need most of the xlarge's 15 GB host RAM. One call with `--diffusion_samples 25` is far cheaper than
-25 calls with `--diffusion_samples 1`.
+186-residue example padded to 192. One call with `--diffusion_samples 25` is far cheaper than 25
+calls with `--diffusion_samples 1`.
+
+Compared with the earlier PyTorch Native Beta 5 build of this package (same instance type, same
+method), SDK 2.33 is 2-16% faster at 64-256 tokens, within 5% at 384-512 tokens, and 3-5% slower
+at 640-1,024 tokens.
 
 ### Command-line time per input (inf2.xlarge, 186-token example)
 
-One `boltz_neuron predict` command, including model load and output writing:
-
-| ds | default | `BOLTZ_NEURON_PRECOMPILE=1` |
-|---:|---:|---:|
-| 1 | 21-25 s | 13-14 s |
-| 8 | 28-34 s | 22-25 s |
-| 25 | 58-63 s | 52-55 s |
-
-To process many inputs, pass a **directory** to one command: startup is paid once.
+One `boltz_neuron predict` command on a fresh inf2.xlarge after restoring the prebuilt cache,
+including model load and output writing: about 72 s for ds=1 and ds=8 and 93 s for ds=25 (24, 32
+and 52 s of that is the prediction itself). The first command after boot takes about 4 minutes
+(the DLAMI's packages load from disk for the first time). To process many inputs, pass a
+**directory** to one command: startup is paid once.
 
 ## Input size and padding
 
-- **Largest input: 1,088 tokens per chip.** More diffusion samples lower that (at 1,024 tokens, ds=8
-  fits and ds=25 does not).
-- **Cap the MSA above ~700 tokens.** The loaded MSA uses device memory: at ~890 residues, 8,192 MSA
-  sequences fail, 4,096 fail on some runs, and 2,048 runs reliably with unchanged accuracy (Boltz-2
-  uses 1,024 MSA rows inside the model by default). Use `--max_msa_seqs 2048`.
+- **Largest input: 1,056 tokens per chip at `--diffusion_samples 1`.** With more samples the limit is
+  lower: 960 tokens runs at ds=8, 1,024 tokens fails at ds=8 (device memory), 640 tokens runs at
+  ds=25. 1,088 tokens no longer fits (it did with the Beta 5 build).
+- **Cap the MSA above ~700 tokens.** The loaded MSA uses device memory. Use `--max_msa_seqs 2048`
+  (Boltz-2 uses 1,024 MSA rows inside the model by default).
 - **Padding.** On Inferentia2, token counts that are not a multiple of 32 run up to 1.6x slower (one
   compiled graph does far more data movement). The package pads every input to the next multiple of
   32, and pads 768 and 896 tokens (sizes the compiler cannot handle) to 832 and 928. Pad tokens are
@@ -115,10 +127,11 @@ To process many inputs, pass a **directory** to one command: startup is paid onc
 
 ## Accuracy
 
-- bf16, padding and the caches were validated against fp32, unpadded and uncached runs. Caches and
-  precompile give bit-identical output.
-- On two ~765-residue proteins with MSAs (PDB 3W7T, 5A7M), predictions match the crystal structures
-  at 0.54-0.93 Å CA-RMSD (lDDT-CA 0.978-0.986).
+- bf16, padding and the caches were validated against fp32, unpadded and uncached runs. Caches
+  give bit-identical output.
+- On SDK 2.33, two ~765-residue proteins with MSAs (PDB 3W7T, 5A7M; `--max_msa_seqs 2048`, padded
+  to 832 tokens, seeds 0 and 1) match the crystal structures at 0.62-0.92 Å CA-RMSD (lDDT-CA
+  0.981-0.983), the same as the Beta 5 build (0.54-0.90 Å, 0.982-0.986).
 - Boltz-2's diffusion is stochastic: two runs that differ only in the seed can differ by several Å.
   Compare structures against that spread, not against zero.
 
@@ -128,13 +141,12 @@ To process many inputs, pass a **directory** to one command: startup is paid onc
 |---|---|---|
 | NEFF cache (`/tmp/neff_cache`) | compiling each graph (minutes per input shape) | on |
 | AOTAutograd cache | re-lowering the diffusion model in each new process | on (`BOLTZ_NEURON_AOT_CACHE`) |
-| Dynamo precompile package | re-tracing the diffusion model in each new process | off (`BOLTZ_NEURON_PRECOMPILE=1`) |
 
-Precompile is off by default because the first precompile run of a shape not yet in the package is
-slow (minutes). Build packages ahead of time with `build_cache.sh`, and rebuild after code changes.
+Caches match only an environment installed by this repo's `scripts/setup_inf2.sh` on the same SDK
+release (the cache key includes a hash of the installed `torch_neuronx` sources).
 
-Caches match only an environment installed by this repo's `scripts/setup_inf2.sh` at the same
-commit.
+`BOLTZ_NEURON_PRECOMPILE=1` (a dynamo precompile package that also skips re-tracing) worked with the
+Beta 5 build but does not load on torch 2.14, so it is not recommended on SDK 2.33.
 
 ### Building a cache for your inputs
 
@@ -159,14 +171,15 @@ Environment variables; the defaults are the validated configuration.
 
 | variable | default | meaning |
 |-----|---------|---------|
-| `NEURON_PLATFORM_TARGET_OVERRIDE` | none | **set to `inf2`** |
+| `NEURON_PLATFORM_TARGET_OVERRIDE` | none | **leave unset** on SDK 2.33 (the package removes `inf2`) |
+| `TORCH_NEURONX_INT64_MODE` | `packed` (set by the package) | `native` gives wrong int64 results on Inferentia2 |
 | `BOLTZ_NEURON_PAD` | `32` | pad the token count to a multiple of this (`0` or `1` disables padding) |
 | `BOLTZ_NEURON_PAD_MAX_ADD` | `-1` | pad only if it adds at most this many tokens (`-1` = no limit) |
 | `BOLTZ_NEURON_BAD_SHAPES` | `768=832,896=928` | token counts the compiler cannot handle, and their replacement (`""` disables) |
 | `BOLTZ_NEURON_DTYPE` | `bf16` | `fp32` disables bf16 |
 | `BOLTZ_NEURON_COMPILE_STRUCTURE` | `1` | `0` disables compiling the diffusion model |
 | `BOLTZ_NEURON_AOT_CACHE` | `1` | reuse the traced diffusion model across processes |
-| `BOLTZ_NEURON_PRECOMPILE` | `0` | `1` saves/loads a dynamo precompile package |
+| `BOLTZ_NEURON_PRECOMPILE` | `0` | `1` saves/loads a dynamo precompile package (does not load on SDK 2.33) |
 | `BOLTZ_NEURON_NUM_THREADS` | `2` | torch thread count when precompile is on |
 | `BOLTZ_NEURON_DROP_DISTO` | `1` | drop a training-only feature before it reaches the device |
 | `BOLTZ_NEURON_WRITER_CPU` | `1` | remove padding from outputs on CPU |
