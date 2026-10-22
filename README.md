@@ -1,7 +1,7 @@
 # boltz-neuron
 
-Run **Boltz-2** biomolecular structure prediction on **AWS Inferentia2 (inf2)** with
-**PyTorch Native**, through the same command line as `boltz predict`.
+Run **Boltz-2** biomolecular structure prediction on **AWS Inferentia2 (inf2)** and **Trainium2
+(trn2)** with **PyTorch Native**, through the same command line as `boltz predict`.
 
 The package wraps the stock [`boltz`](https://github.com/jwohlwend/boltz) v2.2.1 (unchanged) and
 applies a validated configuration automatically when you run `python -m boltz_neuron`: bf16
@@ -9,13 +9,16 @@ inference, a compiled diffusion model, sequence-length padding to fast shapes, c
 restarts, and the Inferentia2 fixes described in [NOTES.md](NOTES.md).
 
 Runs on the public **AWS Neuron SDK 2.33** torch-neuronx DLAMI; no containers or private
-packages. Validated on **inf2.xlarge** and **inf2.8xlarge** (one Inferentia2 chip, two NeuronCores)
-for single protein chains of 64-1,056 tokens. (PyTorch Native is officially supported on Trainium2/3;
-Inferentia2 works with the fixes in [NOTES.md](NOTES.md) but is not an AWS-supported target.)
+packages. Validated for single protein chains on **inf2.xlarge / inf2.8xlarge** (one Inferentia2
+chip, 64-1,056 tokens) and **trn2.3xlarge** (one Trainium2 device, 64-1,280 tokens). The same install
+and the same commands work on both; the package detects the instance. (PyTorch Native is officially
+supported on Trainium2/3; Inferentia2 works with the fixes in [NOTES.md](NOTES.md) but is not an
+AWS-supported target.)
 
 ## Requirements
 
-- An inf2 instance (inf2.xlarge to run, inf2.8xlarge or larger to compile new shapes) launched from
+- An inf2 instance (inf2.xlarge to run, inf2.8xlarge or larger to compile new shapes), or a trn2
+  instance (trn2.3xlarge runs and compiles), launched from
   **Deep Learning AMI Neuron torch-neuronx 2.14.0 (Ubuntu 24.04) SDK 2.33.0** (or the SDK 2.33
   multi-framework DLAMI). Look up the AMI ID for your region with:
 
@@ -29,7 +32,7 @@ Inferentia2 works with the fixes in [NOTES.md](NOTES.md) but is not an AWS-suppo
   2.14.0, torch-neuronx 2.14.3, neuronx-cc 2.28.7631, nki 0.7.0) and adds Boltz-2 to it.
 - A root volume of at least 100 GB (300 GB on the compile host).
 
-## Quick start (inf2.xlarge)
+## Quick start (inf2.xlarge or trn2.3xlarge)
 
 ```bash
 # 1. Install (about 3 minutes)
@@ -38,9 +41,10 @@ bash scripts/setup_inf2.sh
 
 # 2. Restore the prebuilt cache, so the example runs without compiling
 source /opt/aws_neuronx_venv_torch_neuronx_2_14_0/bin/activate
-hf download jburtoft/boltz-neuron-cache boltz_neuron_cache_v8_sdk233_ds1-8-25.tgz \
-    --repo-type dataset --local-dir ~/
-bash scripts/restore_cache.sh ~/boltz_neuron_cache_v8_sdk233_ds1-8-25.tgz
+CACHE=boltz_neuron_cache_v8_sdk233_ds1-8-25.tgz          # inf2
+# CACHE=boltz_neuron_cache_v8_sdk233_trn2_ds1-8-25.tgz   # trn2
+hf download jburtoft/boltz-neuron-cache $CACHE --repo-type dataset --local-dir ~/
+bash scripts/restore_cache.sh ~/$CACHE
 
 # 3. Predict (same arguments as `boltz predict`)
 export NEURON_RT_VISIBLE_CORES=0
@@ -49,7 +53,9 @@ python -m boltz_neuron predict examples/8eil.yaml --out_dir out \
 ```
 
 Do not set `NEURON_PLATFORM_TARGET_OVERRIDE` (earlier versions of this package needed `inf2`; on SDK
-2.33 the package removes it, see NOTES.md).
+2.33 the package removes it, see NOTES.md). On trn2 the package runs at **LNC=1** (8 logical
+NeuronCores per device, `NEURON_RT_VISIBLE_CORES=0`..`7`) because the default LNC=2 is less accurate in
+bf16 (see [Trainium2](#trainium2-trn2)).
 
 The output is a standard Boltz-2 mmCIF structure plus confidence files in `out/`.
 
@@ -57,7 +63,7 @@ The output is a standard Boltz-2 mmCIF structure plus confidence files in `out/`
 Other inputs compile on their first run, which needs more host RAM than an inf2.xlarge has; see
 [Building a cache](#building-a-cache-for-your-inputs).
 
-## Performance
+## Performance (Inferentia2)
 
 Neuron SDK 2.33 (torch-neuronx 2.14.3), bf16, `--recycling_steps 3 --sampling_steps 50`, fk_steering
 off, single protein chains without MSA, warm (already compiled). `ds` = `--diffusion_samples`.
@@ -112,6 +118,57 @@ and 52 s of that is the prediction itself). The first command after boot takes a
 (the DLAMI's packages load from disk for the first time). To process many inputs, pass a
 **directory** to one command: startup is paid once.
 
+## Trainium2 (trn2)
+
+Measured on a **trn2.3xlarge** (one Trainium2 device), Neuron SDK 2.33, same settings and method as
+the Inferentia2 tables. The package runs at **LNC=1**: 8 logical NeuronCores, two per HBM bank.
+
+### Latency: seconds per prediction, one logical NeuronCore (LNC=1)
+
+| tokens | ds=1 | ds=8 | ds=25 |
+|---:|---:|---:|---:|
+| 64 | 4.3 | 6.8 | 10.5 |
+| 128 | 5.4 | 8.6 | 13.8 |
+| 192 | 10.2 | 15.5 | 26.6 |
+| 256 | 13.3 | 20.0 | 43.7 |
+| 384 | 25.9 | 36.5 | 67.4 |
+| 512 | 50.8 | 68.6 | 118.8 |
+| 640 | 94.9 | 129.9 | 210.0 * |
+| 960 | 255.8 | 336.1 | 521.3 |
+| 1,024 | 318.8 | 406.9 | |
+| 1,056 | 366.7 | 479.1 | |
+
+### Throughput: structures per second per Trainium2 device
+
+| tokens | ds=1 | ds=8 | ds=25 | workers |
+|---:|---:|---:|---:|---|
+| 64 | 1.49 | 6.01 | 12.9 | 8 |
+| 128 | 1.14 | 4.98 | 10.2 | 8 |
+| 192 | 0.716 | 3.35 | 6.33 | 8 |
+| 256 | 0.543 | 2.77 | 4.04 | 8 |
+| 384 | 0.294 | 1.63 | 2.75 | 8 |
+| 512 | 0.142 | 0.840 | 1.52 | 8 |
+| 640 | 0.081 | 0.473 | 0.895 * | 8 |
+| 960 | 0.016 | 0.095 | 0.193 | 4 |
+| 1,024 | 0.013 | 0.079 | | 4 |
+| 1,056 | 0.011 | 0.067 | | 4 |
+
+\* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`. Up to 640 tokens, one worker runs on each of the 8 logical
+cores (`NEURON_RT_VISIBLE_CORES=0`..`7`). From 960 tokens two workers no longer fit in one 24 GB HBM
+bank, so run one worker per bank (cores 0, 2, 4, 6).
+
+**Largest input on trn2: 1,280 tokens** (ds=1, one logical core); 1,536 does not fit. At 960 tokens and
+ds=25 the device is close to full (the runtime retries allocations, which makes that cell slow).
+
+### Why LNC=1 on trn2
+
+trn2 defaults to LNC=2 (4 logical cores). With SDK 2.33 and bf16, Boltz-2 compiled at LNC=2 is less
+accurate: on two ~765-residue proteins (3W7T, 5A7M; MSA, 832 tokens) CA-RMSD to the crystal is
+1.6-2.2 Å and lDDT-CA 0.84-0.86, against 0.61-0.89 Å and 0.980-0.983 at LNC=1 (and on Inferentia2).
+fp32 at LNC=2 is accurate, so the difference is in the LNC=2 bf16 build. The package therefore sets
+`NEURON_LOGICAL_NC_CONFIG=1` on trn2 unless you set it yourself (it warns for LNC=2 with bf16). LNC=1
+also gives more throughput per device: 6-58% more than LNC=2 at 64-640 tokens.
+
 ## Input size and padding
 
 - **Largest input: 1,056 tokens per chip at `--diffusion_samples 1`.** With more samples the limit is
@@ -131,7 +188,8 @@ and 52 s of that is the prediction itself). The first command after boot takes a
   give bit-identical output.
 - On SDK 2.33, two ~765-residue proteins with MSAs (PDB 3W7T, 5A7M; `--max_msa_seqs 2048`, padded
   to 832 tokens, seeds 0 and 1) match the crystal structures at 0.62-0.92 Å CA-RMSD (lDDT-CA
-  0.981-0.983), the same as the Beta 5 build (0.54-0.90 Å, 0.982-0.986).
+  0.981-0.983) on Inferentia2, the same as the Beta 5 build (0.54-0.90 Å, 0.982-0.986), and at
+  0.61-0.89 Å (lDDT-CA 0.980-0.983) on trn2 at LNC=1.
 - Boltz-2's diffusion is stochastic: two runs that differ only in the seed can differ by several Å.
   Compare structures against that spread, not against zero.
 
@@ -150,11 +208,12 @@ Beta 5 build but does not load on torch 2.14, so it is not recommended on SDK 2.
 
 ### Building a cache for your inputs
 
-Compiling needs about 40 GB of host RAM per graph, so build on an **inf2.8xlarge** and run on an
-inf2.xlarge:
+Compiling needs about 40 GB of host RAM per graph, so on Inferentia2 build on an **inf2.8xlarge**
+and run on an inf2.xlarge. A trn2.3xlarge (124 GB) can compile for itself. Caches are specific to
+the chip (Inferentia2 vs Trainium2) and, on trn2, the LNC setting:
 
 ```bash
-# On an inf2.8xlarge, after setup_inf2.sh: a directory with one input of every size you serve
+# On an inf2.8xlarge (or the trn2 instance itself), after setup_inf2.sh: one input of every size you serve
 bash scripts/build_cache.sh my_inputs/ 1,8,25     # -> ~/boltz_neuron_cache.tgz
 scp ~/boltz_neuron_cache.tgz <xlarge>:~/
 
@@ -172,6 +231,7 @@ Environment variables; the defaults are the validated configuration.
 | variable | default | meaning |
 |-----|---------|---------|
 | `NEURON_PLATFORM_TARGET_OVERRIDE` | none | **leave unset** on SDK 2.33 (the package removes `inf2`) |
+| `NEURON_LOGICAL_NC_CONFIG` | `1` on trn2 (set by the package) | `2` is less accurate with bf16 on trn2; not used on inf2 |
 | `TORCH_NEURONX_INT64_MODE` | `packed` (set by the package) | `native` gives wrong int64 results on Inferentia2 |
 | `BOLTZ_NEURON_PAD` | `32` | pad the token count to a multiple of this (`0` or `1` disables padding) |
 | `BOLTZ_NEURON_PAD_MAX_ADD` | `-1` | pad only if it adds at most this many tokens (`-1` = no limit) |

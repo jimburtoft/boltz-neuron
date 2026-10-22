@@ -1,10 +1,11 @@
 #!/bin/bash
-# boltz-neuron setup for AWS Inferentia2 (inf2) on the public Neuron SDK 2.33 DLAMI.
+# boltz-neuron setup for AWS Inferentia2 (inf2) and Trainium2 (trn2) on the public Neuron SDK 2.33 DLAMI.
 #
 # Host: "Deep Learning AMI Neuron torch-neuronx 2.14.0 (Ubuntu 24.04) SDK 2.33.0" (or the 2.33
 # multi-framework DLAMI, which has the same venv). Installs Boltz-2 v2.2.1 into the DLAMI's
 # torch-neuronx venv, applies two torch_neuronx fixes for Inferentia2 (NOTES.md) and installs the
-# boltz_neuron package. Takes about 2 minutes. Safe to re-run.
+# boltz_neuron package. Takes about 2 minutes. Safe to re-run. (Named setup_inf2.sh for history; the
+# same script sets up trn2.)
 set -e
 
 VENV="${BOLTZ_NEURON_VENV:-/opt/aws_neuronx_venv_torch_neuronx_2_14_0}"
@@ -34,7 +35,7 @@ uv pip install -q --no-deps boltz==2.2.1 \
   frozendict typing_inspect mypy_extensions click==8.1.7 types-requests wrapt msgpack
 python -c "import boltz.main; print('  boltz OK')" 2>&1 | grep -v "RNG"
 
-echo "=== [4/5] torch_neuronx fixes for Inferentia2 ==="
+echo "=== [4/5] torch_neuronx fixes for Inferentia2 (harmless on trn2) ==="
 # Both are in torch.nonzero's lowering (nonzero_with_count). They must be file edits: the compiled
 # graph is built from this source. The NEFF cache key hashes torch_neuronx's source, so these lines
 # must stay byte-identical to the ones the published cache was built with.

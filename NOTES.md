@@ -14,6 +14,7 @@ model code or weights. Status below is for Neuron SDK 2.33 (torch-neuronx 2.14.3
 | `torch.nonzero` count | setup | `BOOL_SUM_SHIM` | on Inferentia2 the count can come out too small at some lengths |
 | int64 mode | package | `TORCH_NEURONX_INT64_MODE` | the default `native` mode returns wrong values for some int64 ops on Inferentia2; the package sets `packed` |
 | platform target | package | `NEURON_PLATFORM_TARGET_OVERRIDE` | with `inf2` set, torch-neuronx 2.14 picks an RNG kernel that needs a newer NeuronCore; the package removes it |
+| LNC=1 on trn2 | package | `NEURON_LOGICAL_NC_CONFIG` | at the trn2 default LNC=2, the bf16 build is less accurate (1.6-2.2 Å vs 0.6-0.9 Å CA-RMSD on two real proteins) |
 | random numbers on CPU | package | `WORKAROUND(gen2-rng)` | on Inferentia2, `torch.randn(device="neuron")` recurses forever; random tensors are drawn on CPU and copied (same values for a given `--seed`) |
 | outputs unpadded on CPU | package | `WORKAROUND(nonzero-index)` | on-device boolean indexing can return wrong indices at some lengths |
 | tokens padded to a multiple of 32 | package | `BOLTZ_NEURON_PAD` | other token counts make one graph do ~N x 384 extra DMA transfers |
@@ -29,6 +30,9 @@ column. Each fix is meant to be removed once the underlying Neuron issue is fixe
 
 - **Not an AWS-supported target.** PyTorch Native (torch-neuronx 2.14) is supported on Trainium2/3.
   It runs on Inferentia2 with the fixes above; re-check them on each new SDK release.
+- **On trn2** the Inferentia2-only fixes are inactive or harmless: the RNG workaround turns itself
+  off (trn2 has the device RNG), and the int64 mode and `torch.nonzero` fixes give the same results
+  as the defaults there (checked).
 - **Each input shape compiles once.** A shape is the padded token count, padded atom count and
   `--diffusion_samples`. The first run of a new shape takes minutes and about 40 GB of host RAM,
   so compile on an inf2.8xlarge and copy the cache (`scripts/build_cache.sh`).
