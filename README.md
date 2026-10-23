@@ -157,8 +157,34 @@ the Inferentia2 tables. The package runs at **LNC=1**: 8 logical NeuronCores, tw
 cores (`NEURON_RT_VISIBLE_CORES=0`..`7`). From 960 tokens two workers no longer fit in one 24 GB HBM
 bank, so run one worker per bank (cores 0, 2, 4, 6).
 
-**Largest input on trn2: 1,280 tokens** (ds=1, one logical core); 1,536 does not fit. At 960 tokens and
-ds=25 the device is close to full (the runtime retries allocations, which makes that cell slow).
+At 960 tokens and ds=25 the device is close to full (the runtime retries allocations, which makes that
+cell slow).
+
+### Input size limits (single protein chain, one worker)
+
+| instance | ds=1 | ds=8 | ds=25 |
+|---|---|---|---|
+| inf2 (one NeuronCore, 16 GB) | **1,056** (1,088 fails) | 960 (1,024 fails) | 640 * (960 not tested) |
+| trn2, LNC=1 (one logical core, one per 24 GB HBM bank) | **1,280** (higher not tested) | 1,056 (higher not tested) | 960 (higher not tested) |
+| trn2, LNC=2 (one logical core = one 24 GB bank) | **1,280** (1,536 fails) | 1,056 (higher not tested) | 960 (higher not tested) |
+
+"Fails" means the device memory runs out (`NRT_RESOURCE`). \* needs `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`.
+Deep MSAs lower these; use `--max_msa_seqs 2048` above ~700 tokens.
+
+### LNC=1 vs LNC=2 speed on trn2 (bf16)
+
+| tokens | single worker, LNC=1 / LNC=2 (s) | per device, LNC=1 / LNC=2 (structures/s, ds=1) |
+|---:|---|---|
+| 192 | 10.2 / 7.5 | 0.716 (8 workers) / 0.523 (4) |
+| 512 | 50.8 / 31.1 | 0.142 (8) / 0.129 (4) |
+| 640 | 94.9 / 54.9 | 0.081 (8) / 0.073 (4) |
+| 960 | 255.8 / 145.2 | 0.016 (4) / 0.028 (4) |
+| 1,024 | 318.8 / 195.6 | 0.013 (4) / 0.020 (4) |
+| 1,056 | 366.7 / 207.0 | 0.011 (4) / 0.019 (4) |
+
+Up to 640 tokens LNC=1 gives more per device (8 workers); from 960 tokens only 4 LNC=1 workers fit, and
+LNC=2 is 1.6-1.8x faster per device. **LNC=2 is not used by default because of the accuracy issue
+below**; the LNC=2 numbers are for reference.
 
 ### Why LNC=1 on trn2
 
@@ -167,13 +193,15 @@ accurate: on two ~765-residue proteins (3W7T, 5A7M; MSA, 832 tokens) CA-RMSD to 
 1.6-2.2 Å and lDDT-CA 0.84-0.86, against 0.61-0.89 Å and 0.980-0.983 at LNC=1 (and on Inferentia2).
 fp32 at LNC=2 is accurate, so the difference is in the LNC=2 bf16 build. The package therefore sets
 `NEURON_LOGICAL_NC_CONFIG=1` on trn2 unless you set it yourself (it warns for LNC=2 with bf16). LNC=1
-also gives more throughput per device: 6-58% more than LNC=2 at 64-640 tokens.
+also gives more throughput per device at 64-640 tokens (6-58% more than LNC=2), but less from 960 tokens
+(see the table above). The LNC=2 accuracy issue is under investigation.
 
 ## Input size and padding
 
-- **Largest input: 1,056 tokens per chip at `--diffusion_samples 1`.** With more samples the limit is
-  lower: 960 tokens runs at ds=8, 1,024 tokens fails at ds=8 (device memory), 640 tokens runs at
-  ds=25. 1,088 tokens no longer fits (it did with the Beta 5 build).
+- **Largest input: 1,056 tokens per Inferentia2 chip, 1,280 per Trainium2 logical core**, at
+  `--diffusion_samples 1`; lower with more samples (table in
+  [Input size limits](#input-size-limits-single-protein-chain-one-worker)). On inf2, 1,088 tokens no
+  longer fits (it did with the Beta 5 build).
 - **Cap the MSA above ~700 tokens.** The loaded MSA uses device memory. Use `--max_msa_seqs 2048`
   (Boltz-2 uses 1,024 MSA rows inside the model by default).
 - **Padding.** On Inferentia2, token counts that are not a multiple of 32 run up to 1.6x slower (one
