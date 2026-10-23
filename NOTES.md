@@ -14,7 +14,7 @@ model code or weights. Status below is for Neuron SDK 2.33 (torch-neuronx 2.14.3
 | `torch.nonzero` count | setup | `BOOL_SUM_SHIM` | on Inferentia2 the count can come out too small at some lengths |
 | int64 mode | package | `TORCH_NEURONX_INT64_MODE` | the default `native` mode returns wrong values for some int64 ops on Inferentia2; the package sets `packed` |
 | platform target | package | `NEURON_PLATFORM_TARGET_OVERRIDE` | with `inf2` set, torch-neuronx 2.14 picks an RNG kernel that needs a newer NeuronCore; the package removes it |
-| LNC=1 on trn2 | package | `NEURON_LOGICAL_NC_CONFIG` | at the trn2 default LNC=2, the bf16 build is less accurate (1.6-2.2 Å vs 0.6-0.9 Å CA-RMSD on two real proteins) |
+| graph split at LNC=2 on trn2 | package | `WORKAROUND(lnc2-atom-fusion)` | at LNC=2 the compiler gets one fused graph (atom/token one-hot bmm + windowed atom attention) wrong at some atom counts; splitting it fixes accuracy (1.6-2.2 Å -> 0.6-0.9 Å CA-RMSD on two real proteins) at no speed cost |
 | random numbers on CPU | package | `WORKAROUND(gen2-rng)` | on Inferentia2, `torch.randn(device="neuron")` recurses forever; random tensors are drawn on CPU and copied (same values for a given `--seed`) |
 | outputs unpadded on CPU | package | `WORKAROUND(nonzero-index)` | on-device boolean indexing can return wrong indices at some lengths |
 | tokens padded to a multiple of 32 | package | `BOLTZ_NEURON_PAD` | other token counts make one graph do ~N x 384 extra DMA transfers |

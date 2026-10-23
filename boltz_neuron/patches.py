@@ -28,6 +28,18 @@ import torch.nn.functional as F  # noqa: F401  (kept: closures below resolve F t
 
 _ORIGINAL_TENSOR_FLOAT = torch.Tensor.float
 
+# WORKAROUND(lnc2-atom-fusion): on trn2 at LNC=2 (SDK 2.33, neuronx-cc 2.28), when the atom<->token bmm
+# (one-hot atom_to_token matrix) is compiled into the same graph as the windowed AtomTransformer key
+# gather that follows it, the compiled diffusion score model returns wrong values at some atom counts
+# (e.g. 5,952-6,400 atoms, not 4,096 or 8,192): ~25% error in one denoising step, and 760-residue
+# proteins land 1.6-2.2 A from the crystal instead of 0.6-0.9 A. Each half compiled alone is correct.
+# A graph break between them restores accuracy at no measured speed cost. On by default only on trn2 at
+# LNC=2 (the preamble sets it); BOLTZ_NEURON_ATOM_GRAPH_BREAK=0/1 overrides.
+_ATOM_GRAPH_BREAK = os.environ.get("BOLTZ_NEURON_ATOM_GRAPH_BREAK", "0") == "1"
+# Tested alternative, NOT sufficient on the real model: pass atom_to_token to the compiled graph already
+# as bf16 (the standalone repro passes with it, the real model is still wrong). Off by default.
+_PRECAST_A2T = os.environ.get("BOLTZ_NEURON_PRECAST_A2T", "0") == "1"
+
 
 _ACTIVE_DTYPE: "torch.dtype | None" = None
 
@@ -444,6 +456,12 @@ def _make_preconditioned_forward_dtype_safe(target_dtype: torch.dtype):
                                                     and vv.dtype != target_dtype
                                                     else vv)
                           for kk, vv in v.items()}
+                # Diagnostic only (BOLTZ_NEURON_PRECAST_A2T=1, off): pass atom_to_token as bf16 instead of
+                # int64. Not a sufficient fix for WORKAROUND(lnc2-atom-fusion).
+                if k == "feats" and _PRECAST_A2T and "atom_to_token" in out[k]:
+                    a2t = out[k]["atom_to_token"]
+                    if isinstance(a2t, torch.Tensor) and not a2t.is_floating_point():
+                        out[k]["atom_to_token"] = a2t.to(target_dtype)
             else:
                 # callables, lists, ints, None, etc. -- pass through
                 out[k] = v
@@ -634,6 +652,8 @@ def _make_atom_attention_encoder_forward_dtype_safe(target_dtype: torch.dtype):
             multiplicity=multiplicity,
             to_keys=to_keys,
         )
+        if _ATOM_GRAPH_BREAK:
+            torch._dynamo.graph_break()  # WORKAROUND(lnc2-atom-fusion), see _ATOM_GRAPH_BREAK
 
         # ORIGINAL: with autocast(q.device.type, enabled=False):
         #             q_to_a = self.atom_to_token_trans(q).float()
@@ -671,6 +691,8 @@ def _make_atom_attention_decoder_forward_dtype_safe(target_dtype: torch.dtype):
 
         a_to_q = self.a_to_q_trans(a.to(target_dtype))
         a_to_q = torch.bmm(atom_to_token, a_to_q)
+        if _ATOM_GRAPH_BREAK:
+            torch._dynamo.graph_break()  # WORKAROUND(lnc2-atom-fusion), see _ATOM_GRAPH_BREAK
 
         q = q + a_to_q.to(q.dtype)
         atom_mask = feats["atom_pad_mask"]  # Bool['b m']

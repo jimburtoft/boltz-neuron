@@ -80,18 +80,15 @@ def _instance_type():
         return ""
 
 
-# Trainium2: run at LNC=1 (8 logical cores per device on trn2.3xlarge). With the trn2 default LNC=2,
-# SDK 2.33's bf16 build of Boltz-2 loses accuracy: on two ~765-residue proteins CA-RMSD to the
-# crystal went from 0.6-0.9 A to 1.6-2.2 A and lDDT-CA from 0.98 to 0.84-0.86 (fp32 at LNC=2, and bf16
-# at LNC=1, are both accurate). LNC is read when the runtime starts, so it is set here. Set
-# NEURON_LOGICAL_NC_CONFIG yourself to override (LNC=2 then logs a warning).
+# Trainium2. trn2 defaults to LNC=2 (4 logical cores, 24 GB HBM each). With SDK 2.33 one compiled graph in
+# the diffusion model is wrong at LNC=2 for some atom counts unless it is split (WORKAROUND(lnc2-atom-fusion)
+# in patches.py; found while chasing 1.6-2.2 A vs 0.6-0.9 A CA-RMSD on real proteins). The package keeps
+# the trn2 default LNC=2 and turns that split on. Set NEURON_LOGICAL_NC_CONFIG=1 for 8 x 12 GB cores
+# (more throughput below ~700 tokens). LNC is read when the runtime starts, so this runs before torch.
 INSTANCE = _instance_type()
 if INSTANCE.startswith("trn2"):
-    if "NEURON_LOGICAL_NC_CONFIG" not in os.environ:
-        os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
-    elif os.environ["NEURON_LOGICAL_NC_CONFIG"] == "2" and os.environ.get("BOLTZ_NEURON_DTYPE", "bf16") == "bf16":
-        print("[boltz-neuron] WARNING: NEURON_LOGICAL_NC_CONFIG=2 with bf16 on trn2 is less accurate "
-              "(see NOTES.md); use 1, or BOLTZ_NEURON_DTYPE=fp32", flush=True)
+    if os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2") == "2":
+        os.environ.setdefault("BOLTZ_NEURON_ATOM_GRAPH_BREAK", "1")
 
 import torch
 import torch.nn.functional as F
@@ -455,4 +452,4 @@ def apply():
     _install_writer_cpu_unpad()
     _install_trainer_hook()
     _install_load_hook()
-    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'on' if STEERING else 'off'} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')}")
+    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'on' if STEERING else 'off'} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')}")

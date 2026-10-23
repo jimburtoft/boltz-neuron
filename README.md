@@ -10,7 +10,7 @@ restarts, and the Inferentia2 fixes described in [NOTES.md](NOTES.md).
 
 Runs on the public **AWS Neuron SDK 2.33** torch-neuronx DLAMI; no containers or private
 packages. Validated for single protein chains on **inf2.xlarge / inf2.8xlarge** (one Inferentia2
-chip, 64-1,056 tokens) and **trn2.3xlarge** (one Trainium2 device, 64-1,280 tokens). The same install
+chip, 64-1,056 tokens) and **trn2.3xlarge** (one Trainium2 device, 64-1,408 tokens). The same install
 and the same commands work on both; the package detects the instance. (PyTorch Native is officially
 supported on Trainium2/3; Inferentia2 works with the fixes in [NOTES.md](NOTES.md) but is not an
 AWS-supported target.)
@@ -42,7 +42,7 @@ bash scripts/setup_inf2.sh
 # 2. Restore the prebuilt cache, so the example runs without compiling
 source /opt/aws_neuronx_venv_torch_neuronx_2_14_0/bin/activate
 CACHE=boltz_neuron_cache_v8_sdk233_ds1-8-25.tgz          # inf2
-# CACHE=boltz_neuron_cache_v8_sdk233_trn2_ds1-8-25.tgz   # trn2
+# CACHE=boltz_neuron_cache_v9_sdk233_trn2_lnc2_ds1-8-25.tgz   # trn2 (LNC=1: ..._v8_sdk233_trn2_ds1-8-25.tgz)
 hf download jburtoft/boltz-neuron-cache $CACHE --repo-type dataset --local-dir ~/
 bash scripts/restore_cache.sh ~/$CACHE
 
@@ -53,9 +53,9 @@ python -m boltz_neuron predict examples/8eil.yaml --out_dir out \
 ```
 
 Do not set `NEURON_PLATFORM_TARGET_OVERRIDE` (earlier versions of this package needed `inf2`; on SDK
-2.33 the package removes it, see NOTES.md). On trn2 the package runs at **LNC=1** (8 logical
-NeuronCores per device, `NEURON_RT_VISIBLE_CORES=0`..`7`) because the default LNC=2 is less accurate in
-bf16 (see [Trainium2](#trainium2-trn2)).
+2.33 the package removes it, see NOTES.md). On trn2 the package runs at the trn2 default **LNC=2**
+(4 logical NeuronCores per device, `NEURON_RT_VISIBLE_CORES=0`..`3`, 24 GB each) with a fix for a
+compiler issue at LNC=2 (see [Trainium2](#trainium2-trn2)).
 
 The output is a standard Boltz-2 mmCIF structure plus confidence files in `out/`.
 
@@ -121,84 +121,82 @@ and 52 s of that is the prediction itself). The first command after boot takes a
 ## Trainium2 (trn2)
 
 Measured on a **trn2.3xlarge** (one Trainium2 device), Neuron SDK 2.33, same settings and method as
-the Inferentia2 tables. The package runs at **LNC=1**: 8 logical NeuronCores, two per HBM bank.
+the Inferentia2 tables. Default: **LNC=2**, 4 logical NeuronCores of 24 GB each, one worker per core.
 
-### Latency: seconds per prediction, one logical NeuronCore (LNC=1)
+### Latency: seconds per prediction, one logical NeuronCore (LNC=2)
 
 | tokens | ds=1 | ds=8 | ds=25 |
 |---:|---:|---:|---:|
-| 64 | 4.3 | 6.8 | 10.5 |
-| 128 | 5.4 | 8.6 | 13.8 |
-| 192 | 10.2 | 15.5 | 26.6 |
-| 256 | 13.3 | 20.0 | 43.7 |
-| 384 | 25.9 | 36.5 | 67.4 |
-| 512 | 50.8 | 68.6 | 118.8 |
-| 640 | 94.9 | 129.9 | 210.0 * |
-| 960 | 255.8 | 336.1 | 521.3 |
-| 1,024 | 318.8 | 406.9 | |
-| 1,056 | 366.7 | 479.1 | |
+| 64 | 4.1 | 7.6 | 8.0 |
+| 128 | 4.6 | 6.9 | 10.2 |
+| 192 | 7.5 | 10.5 | 16.9 |
+| 256 | 9.4 | 13.7 | 25.8 |
+| 384 | 16.7 | 23.3 | 49.8 |
+| 512 | 31.1 | 41.5 | 72.2 |
+| 640 | 54.9 | 73.7 | 117.5 * |
+| 960 | 145.2 | 186.0 | 292.3 |
+| 1,024 | 195.6 | 253.6 | |
+| 1,056 | 207.0 | 269.9 | |
 
-### Throughput: structures per second per Trainium2 device
+### Throughput: structures per second per Trainium2 device (4 workers, LNC=2)
 
-| tokens | ds=1 | ds=8 | ds=25 | workers |
-|---:|---:|---:|---:|---|
-| 64 | 1.49 | 6.01 | 12.9 | 8 |
-| 128 | 1.14 | 4.98 | 10.2 | 8 |
-| 192 | 0.716 | 3.35 | 6.33 | 8 |
-| 256 | 0.543 | 2.77 | 4.04 | 8 |
-| 384 | 0.294 | 1.63 | 2.75 | 8 |
-| 512 | 0.142 | 0.840 | 1.52 | 8 |
-| 640 | 0.081 | 0.473 | 0.895 * | 8 |
-| 960 | 0.016 | 0.095 | 0.193 | 4 |
-| 1,024 | 0.013 | 0.079 | | 4 |
-| 1,056 | 0.011 | 0.067 | | 4 |
+| tokens | ds=1 | ds=8 | ds=25 |
+|---:|---:|---:|---:|
+| 64 | 0.943 | 3.94 | 11.3 |
+| 128 | 0.859 | 4.29 | 8.91 |
+| 192 | 0.523 | 2.86 | 5.75 |
+| 256 | 0.423 | 2.26 | 3.81 |
+| 384 | 0.239 | 1.37 | 2.00 |
+| 512 | 0.129 | 0.767 | 1.38 |
+| 640 | 0.073 | 0.433 | 0.848 * |
+| 960 | 0.028 | 0.172 | 0.348 |
+| 1,024 | 0.020 | 0.127 | |
+| 1,056 | 0.019 | 0.119 | |
 
-\* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`. Up to 640 tokens, one worker runs on each of the 8 logical
-cores (`NEURON_RT_VISIBLE_CORES=0`..`7`). From 960 tokens two workers no longer fit in one 24 GB HBM
-bank, so run one worker per bank (cores 0, 2, 4, 6).
-
-At 960 tokens and ds=25 the device is close to full (the runtime retries allocations, which makes that
-cell slow).
+\* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`. These LNC=2 timings were taken before the compiler fix
+below was added; with the fix, re-timed cells are unchanged (192 tokens: 7.44 / 10.54 / 16.58 s;
+512: 31.6 s; 960: 144.2 s).
 
 ### Input size limits (single protein chain, one worker)
 
 | instance | ds=1 | ds=8 | ds=25 |
 |---|---|---|---|
 | inf2 (one NeuronCore, 16 GB) | **1,056** (1,088 fails) | 960 (1,024 fails) | 640 * (960 not tested) |
-| trn2, LNC=1 (one logical core, one per 24 GB HBM bank) | **1,280** (higher not tested) | 1,056 (higher not tested) | 960 (higher not tested) |
-| trn2, LNC=2 (one logical core = one 24 GB bank) | **1,280** (1,536 fails) | 1,056 (higher not tested) | 960 (higher not tested) |
+| **trn2, LNC=2** (default; one 24 GB logical core) | **1,408** (1,536 fails) | **1,280** (1,408 fails) | **960** (1,024 fails) |
+| trn2, LNC=1 (12 GB logical cores; one worker per HBM bank) | 1,280 (higher not tested) | 1,056 (higher not tested) | 960 (higher not tested) |
 
 "Fails" means the device memory runs out (`NRT_RESOURCE`). \* needs `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`.
-Deep MSAs lower these; use `--max_msa_seqs 2048` above ~700 tokens.
+Deep MSAs lower these; use `--max_msa_seqs 2048` above ~700 tokens. Near the limits the runtime
+retries allocations, which slows those runs.
 
-### LNC=1 vs LNC=2 speed on trn2 (bf16)
+### LNC=2 or LNC=1
 
-| tokens | single worker, LNC=1 / LNC=2 (s) | per device, LNC=1 / LNC=2 (structures/s, ds=1) |
+| tokens | single worker, LNC=2 / LNC=1 (s) | per device, LNC=2 / LNC=1 (structures/s, ds=1) |
 |---:|---|---|
-| 192 | 10.2 / 7.5 | 0.716 (8 workers) / 0.523 (4) |
-| 512 | 50.8 / 31.1 | 0.142 (8) / 0.129 (4) |
-| 640 | 94.9 / 54.9 | 0.081 (8) / 0.073 (4) |
-| 960 | 255.8 / 145.2 | 0.016 (4) / 0.028 (4) |
-| 1,024 | 318.8 / 195.6 | 0.013 (4) / 0.020 (4) |
-| 1,056 | 366.7 / 207.0 | 0.011 (4) / 0.019 (4) |
+| 192 | 7.5 / 10.2 | 0.523 (4 workers) / 0.716 (8) |
+| 512 | 31.1 / 50.8 | 0.129 (4) / 0.142 (8) |
+| 640 | 54.9 / 94.9 | 0.073 (4) / 0.081 (8) |
+| 960 | 145.2 / 255.8 | 0.028 (4) / 0.016 (4) |
+| 1,056 | 207.0 / 366.7 | 0.019 (4) / 0.011 (4) |
 
-Up to 640 tokens LNC=1 gives more per device (8 workers); from 960 tokens only 4 LNC=1 workers fit, and
-LNC=2 is 1.6-1.8x faster per device. **LNC=2 is not used by default because of the accuracy issue
-below**; the LNC=2 numbers are for reference.
+LNC=2 (default) has the lowest latency, the largest inputs and, from ~700 tokens, the most throughput.
+Up to 640 tokens, `NEURON_LOGICAL_NC_CONFIG=1` (8 workers) gives 6-58% more structures per second per
+device. Accuracy is the same at both settings (below). Caches are per LNC setting.
 
-### Why LNC=1 on trn2
+### LNC=2 accuracy fix
 
-trn2 defaults to LNC=2 (4 logical cores). With SDK 2.33 and bf16, Boltz-2 compiled at LNC=2 is less
-accurate: on two ~765-residue proteins (3W7T, 5A7M; MSA, 832 tokens) CA-RMSD to the crystal is
-1.6-2.2 Å and lDDT-CA 0.84-0.86, against 0.61-0.89 Å and 0.980-0.983 at LNC=1 (and on Inferentia2).
-fp32 at LNC=2 is accurate, so the difference is in the LNC=2 bf16 build. The package therefore sets
-`NEURON_LOGICAL_NC_CONFIG=1` on trn2 unless you set it yourself (it warns for LNC=2 with bf16). LNC=1
-also gives more throughput per device at 64-640 tokens (6-58% more than LNC=2), but less from 960 tokens
-(see the table above). The LNC=2 accuracy issue is under investigation.
+With SDK 2.33, one compiled graph in Boltz-2's diffusion model returns wrong values at LNC=2 for some
+atom counts: when the atom/token one-hot matrix multiply is compiled into the same graph as the
+windowed atom attention that follows it (e.g. 5,952-6,400 atoms; not 4,096, 6,144 or 8,192). On
+two ~765-residue proteins this put predictions 1.6-2.2 Å from the crystal (lDDT-CA 0.84-0.86). The
+same issue is present in the earlier PyTorch Native Beta 5 compiler. The package splits that graph
+in two (`BOLTZ_NEURON_ATOM_GRAPH_BREAK=1`, set automatically on trn2 at LNC=2), which restores
+accuracy with no measurable speed cost: **0.61-0.92 Å, lDDT-CA 0.979-0.982** on the same proteins
+(two seeds each), the same as LNC=1 and Inferentia2. Details in [NOTES.md](NOTES.md).
 
 ## Input size and padding
 
-- **Largest input: 1,056 tokens per Inferentia2 chip, 1,280 per Trainium2 logical core**, at
+- **Largest input: 1,056 tokens per Inferentia2 chip, 1,408 per Trainium2 logical core (LNC=2)**, at
   `--diffusion_samples 1`; lower with more samples (table in
   [Input size limits](#input-size-limits-single-protein-chain-one-worker)). On inf2, 1,088 tokens no
   longer fits (it did with the Beta 5 build).
@@ -217,7 +215,7 @@ also gives more throughput per device at 64-640 tokens (6-58% more than LNC=2), 
 - On SDK 2.33, two ~765-residue proteins with MSAs (PDB 3W7T, 5A7M; `--max_msa_seqs 2048`, padded
   to 832 tokens, seeds 0 and 1) match the crystal structures at 0.62-0.92 Å CA-RMSD (lDDT-CA
   0.981-0.983) on Inferentia2, the same as the Beta 5 build (0.54-0.90 Å, 0.982-0.986), and at
-  0.61-0.89 Å (lDDT-CA 0.980-0.983) on trn2 at LNC=1.
+  0.61-0.92 Å (lDDT-CA 0.979-0.983) on trn2 (LNC=2 with the fix, and LNC=1).
 - Boltz-2's diffusion is stochastic: two runs that differ only in the seed can differ by several Å.
   Compare structures against that spread, not against zero.
 
@@ -259,7 +257,8 @@ Environment variables; the defaults are the validated configuration.
 | variable | default | meaning |
 |-----|---------|---------|
 | `NEURON_PLATFORM_TARGET_OVERRIDE` | none | **leave unset** on SDK 2.33 (the package removes `inf2`) |
-| `NEURON_LOGICAL_NC_CONFIG` | `1` on trn2 (set by the package) | `2` is less accurate with bf16 on trn2; not used on inf2 |
+| `NEURON_LOGICAL_NC_CONFIG` | trn2 default (`2`) | `1` = 8 smaller cores on trn2 (more throughput below ~700 tokens); not used on inf2 |
+| `BOLTZ_NEURON_ATOM_GRAPH_BREAK` | `1` on trn2 at LNC=2, else `0` | splits one diffusion-model graph (LNC=2 compiler fix) |
 | `TORCH_NEURONX_INT64_MODE` | `packed` (set by the package) | `native` gives wrong int64 results on Inferentia2 |
 | `BOLTZ_NEURON_PAD` | `32` | pad the token count to a multiple of this (`0` or `1` disables padding) |
 | `BOLTZ_NEURON_PAD_MAX_ADD` | `-1` | pad only if it adds at most this many tokens (`-1` = no limit) |
