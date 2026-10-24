@@ -12,26 +12,50 @@ VENV="${BOLTZ_NEURON_VENV:-/opt/aws_neuronx_venv_torch_neuronx_2_14_0}"
 PKG_DIR="$(cd "$(dirname "$0")/.." && pwd)"   # repo root (has boltz_neuron/)
 
 echo "=== [1/5] Neuron device + venv check ==="
-neuron-ls | head -8 || { echo "neuron-ls failed -- not a Neuron instance?"; exit 1; }
-[ -f "$VENV/bin/activate" ] || { echo "$VENV not found -- use the SDK 2.33 torch-neuronx DLAMI"; exit 1; }
-source "$VENV/bin/activate"
+neuron-ls 2>/dev/null | head -8 || echo "  (neuron-ls unavailable here; continuing)"
+if [ "$VENV" = system ]; then
+  # Container images (e.g. public.ecr.aws/neuron/torch-neuronx:2.14.0-...-sdk2.33.0) have no venv.
+  echo "  using the current python: $(command -v python3)"
+  python() { python3 "$@"; }; pip() { python3 -m pip "$@"; }; export -f python pip
+else
+  [ -f "$VENV/bin/activate" ] || { echo "$VENV not found -- use the SDK 2.33 torch-neuronx DLAMI"; exit 1; }
+  source "$VENV/bin/activate"
+fi
 python -c "import torch_neuronx" 2>/dev/null || { echo "torch_neuronx not importable in $VENV"; exit 1; }
 
 echo "=== [2/5] 64 GB swap (neuronx-cc host-RAM protection) ==="
-if ! swapon --show | grep -q /swapfile; then
+if [ "${BOLTZ_NEURON_SKIP_SWAP:-0}" = 1 ] || [ "$VENV" = system ]; then
+  echo "  skipped"
+elif ! swapon --show | grep -q /swapfile; then
   sudo fallocate -l 64G /swapfile && sudo chmod 600 /swapfile
   sudo mkswap --force /swapfile >/dev/null && sudo swapon /swapfile
 fi
-swapon --show
+swapon --show 2>/dev/null || true
 
 echo "=== [3/5] Boltz-2 v2.2.1 + dependencies (into $VENV) ==="
 # --no-deps keeps the DLAMI's torch / numpy / torch-neuronx untouched. Boltz 2.2.1 pins numpy<2,
 # but runs on the DLAMI's numpy 2.5 (validated).
 pip install -q uv
-uv pip install -q --no-deps boltz==2.2.1 \
-  einx==0.3.0 mashumaro==3.14 numba llvmlite omegaconf "antlr4-python3-runtime==4.9.3" \
+UVSYS=""; [ "$VENV" = system ] && UVSYS="--system --break-system-packages"
+# Pins validated on the DLAMI venv (python 3.12). Python >= 3.13 (container images) has no wheels for
+# the older gemmi / biopython / dm-tree, so there the newest wheels are used.
+if python3 -c "import sys; sys.exit(sys.version_info < (3, 13))"; then
+  OLD="biopython gemmi dm-tree mashumaro"
+  # container images ship fewer packages than the DLAMI venv
+  # Install the third-party dependencies WITH their own dependencies (pinning the image's torch/numpy),
+  # then boltz itself with --no-deps (its torch/numpy pins would fight the image's).
+  python3 -m pip freeze 2>/dev/null | grep -i -E "^(torch|torch-neuronx|numpy|neuronx-cc|nki|libneuronxla)==" > /tmp/bn_constraints.txt
+  python3 -m uv pip install -q $UVSYS -c /tmp/bn_constraints.txt scikit-learn scipy pandas einops numba llvmlite \
+    omegaconf "antlr4-python3-runtime==4.9.3" pytorch-lightning==2.6.6 torchmetrics fairscale==0.4.13 rdkit \
+    modelcif==1.2 ihm biopython gemmi dm-tree mashumaro chembl_structure_pipeline==1.2.2 hydra-core==1.3.2 \
+    einx==0.3.0 click==8.1.7 requests pyyaml tqdm
+else
+  OLD="biopython==1.84 gemmi==0.6.5 dm-tree==0.1.8 mashumaro==3.14"
+fi
+python3 -m uv pip install -q $UVSYS --no-deps boltz==2.2.1 \
+  einx==0.3.0 numba llvmlite omegaconf "antlr4-python3-runtime==4.9.3" \
   pytorch-lightning==2.6.6 lightning-utilities torchmetrics fairscale==0.4.13 rdkit modelcif==1.2 ihm \
-  biopython==1.84 gemmi==0.6.5 chembl_structure_pipeline==1.2.2 dm-tree==0.1.8 hydra-core==1.3.2 \
+  $OLD chembl_structure_pipeline==1.2.2 hydra-core==1.3.2 \
   frozendict typing_inspect mypy_extensions click==8.1.7 types-requests wrapt msgpack
 python -c "import boltz.main; print('  boltz OK')" 2>&1 | grep -v "RNG"
 
@@ -67,7 +91,7 @@ python -c "import boltz_neuron; print('  boltz_neuron OK')"
 echo ""
 echo "=== DONE ==="
 echo "Predict:"
-echo "  source $VENV/bin/activate"
+[ "$VENV" = system ] || echo "  source $VENV/bin/activate"
 echo "  export NEURON_RT_VISIBLE_CORES=0"
 echo "  python -m boltz_neuron predict input.yaml --out_dir out --recycling_steps 3 --sampling_steps 50 --diffusion_samples 1 --num_workers 0"
 echo "Restore a prebuilt cache first (see README) or the first run of each shape compiles."

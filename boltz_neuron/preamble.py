@@ -388,8 +388,12 @@ def _install_load_hook():
             # fails on load and dynamo re-traces (then crashes, see _enable_precompile). Harmless
             # without precompile.
             with torch.inference_mode():
+                # dynamic=False: a second model in the same process (e.g. the affinity pass, which runs
+                # on a cropped complex) calls the score model with new shapes; with automatic dynamic
+                # shapes Dynamo then traces symbolic sizes, which the neuron backend rejects
+                # ("SymIntArrayRef expected to contain only concrete integers"). Each shape compiles once.
                 model.structure_module.score_model = torch.compile(
-                    model.structure_module.score_model, backend="neuron"
+                    model.structure_module.score_model, backend="neuron", dynamic=False
                 )
             _log("compile_structure: score_model wrapped with torch.compile(backend='neuron')")
         # cast to bf16; Lightning's SingleDeviceStrategy(neuron) moves it to the device.

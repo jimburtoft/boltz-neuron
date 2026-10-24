@@ -41,6 +41,12 @@ column. Each fix is meant to be removed once the underlying Neuron issue is fixe
   `--diffusion_samples 8` as 4 chunks of 2; the package leaves it alone (no measurable cost).
   `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1` makes it a cap, which helps large inputs with many samples fit.
 - **Large inputs:** up to 1,056 tokens per chip (ds=1); use `--max_msa_seqs 2048` above ~700 tokens.
-- **Ligands / complexes and fk_steering are not validated.** The confidence head and the steering
-  potentials do boolean indexing on device, which the `nonzero-index` issue can corrupt at some atom
-  counts (protein-only inference does not reach it).
+- **Ligands, complexes and affinity are validated** (see README "Accuracy"). The affinity pass runs
+  a second model on a cropped complex in the same process; the compiled score model is created with
+  `dynamic=False` so the new shape compiles once instead of failing with
+  `SymIntArrayRef expected to contain only concrete integers`.
+- **fk_steering is not validated** (supported, much slower on Inferentia2).
+- **Containers:** `BOLTZ_NEURON_VENV=system bash scripts/setup.sh` installs into the image's python
+  (verified on `public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04`,
+  python 3.14; output identical to the DLAMI venv). Map the device to `/dev/neuron0` when passing a
+  single one (`--device=/dev/neuron3:/dev/neuron0`).

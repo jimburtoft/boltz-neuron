@@ -9,9 +9,10 @@ inference, a compiled diffusion model, sequence-length padding to fast shapes, c
 restarts, and the Inferentia2 fixes described in [NOTES.md](NOTES.md).
 
 Runs on the public **AWS Neuron SDK 2.33** torch-neuronx DLAMI; no containers or private
-packages. Validated for single protein chains on **inf2.xlarge / inf2.8xlarge** (one Inferentia2
-chip, 64-1,056 tokens) and **trn2.3xlarge** (one Trainium2 device, 64-1,408 tokens). The same install
-and the same commands work on both; the package detects the instance. (PyTorch Native is officially
+packages. Validated on **inf2.xlarge / inf2.8xlarge / inf2.24xlarge** (64-1,056 tokens per
+Inferentia2 chip) and **trn2.3xlarge** (64-1,408 tokens per Trainium2 logical core) for single protein
+chains, protein-ligand complexes (including affinity prediction) and protein-protein complexes. The
+same install and the same commands work on both; the package detects the instance. (PyTorch Native is officially
 supported on Trainium2/3; Inferentia2 works with the fixes in [NOTES.md](NOTES.md) but is not an
 AWS-supported target.)
 
@@ -37,7 +38,7 @@ AWS-supported target.)
 ```bash
 # 1. Install (about 3 minutes)
 git clone https://github.com/jimburtoft/boltz-neuron.git && cd boltz-neuron
-bash scripts/setup_inf2.sh
+bash scripts/setup.sh
 
 # 2. Restore the prebuilt cache, so the example runs without compiling
 source /opt/aws_neuronx_venv_torch_neuronx_2_14_0/bin/activate
@@ -117,6 +118,27 @@ including model load and output writing: about 72 s for ds=1 and ds=8 and 93 s f
 and 52 s of that is the prediction itself). The first command after boot takes about 4 minutes
 (the DLAMI's packages load from disk for the first time). To process many inputs, pass a
 **directory** to one command: startup is paid once.
+
+### Larger instances
+
+On an **inf2.24xlarge** (6 chips, 12 NeuronCores) with one worker per NeuronCore, throughput scales
+linearly: 1.07 structures/s at ds=1 and 9.33 at ds=25 (192 tokens), 0.99-1.06x of six inf2.xlarge
+chips; per-worker times match a single worker. Per structure, inf2.xlarge stays the cheapest.
+
+### Inputs with an MSA
+
+The tables above use single-sequence inputs. With an MSA (`--max_msa_seqs 2048`), one NeuronCore,
+warm:
+
+| input | tokens (padded) | ds=1 | ds=8 | ds=25 |
+|---|---:|---:|---:|---:|
+| PDB 3HTB (protein) | 192 | 14.2 s | | 33.8 s |
+| PDB 1M17 (protein) | 384 | 30.4 s | | 76.9 s |
+| PDB 3W7T | 832 | 204.6 s | | does not fit |
+| PDB 6EA2 | 928 | 253.2 s | 333.1 s | does not fit |
+
+At ~200 tokens the MSA adds about 3.6 s per prediction; above ~350 tokens it adds little. Above
+~800 tokens with an MSA, ds=25 does not fit on one Inferentia2 core (use ds=8, or trn2).
 
 ## Trainium2 (trn2)
 
@@ -216,6 +238,21 @@ accuracy with no measurable speed cost: **0.61-0.92 Å, lDDT-CA 0.979-0.982** on
   to 832 tokens, seeds 0 and 1) match the crystal structures at 0.62-0.92 Å CA-RMSD (lDDT-CA
   0.981-0.983) on Inferentia2, the same as the Beta 5 build (0.54-0.90 Å, 0.982-0.986), and at
   0.61-0.92 Å (lDDT-CA 0.979-0.983) on trn2 (LNC=2 with the fix, and LNC=1).
+- ~890-residue proteins (PDB 6EA2, 3B34, MSA, padded 889/891 -> 928 tokens, seeds 0 and 1): 0.37-0.47 Å
+  CA-RMSD (lDDT-CA 0.993-0.997) on Inferentia2 and 0.47-0.50 Å (0.991-0.996) on trn2, the same as the
+  Beta 5 build (0.34-0.44 Å).
+- **Ligands and complexes** (MSA, seeds 0 and 1, vs crystal; CPU fp32 = stock Boltz-2 on CPU):
+
+  | target | metric | Inferentia2 | trn2 | CPU fp32 |
+  |---|---|---|---|---|
+  | 3HTB, T4 lysozyme + 2-propylphenol | ligand RMSD (pocket-aligned) | 0.33-0.35 Å | 0.34 Å | 0.34 Å |
+  | | affinity (log10 IC50 / P(binder)) | -0.21, -0.14 / 0.41, 0.40 | -0.22 / 0.44 | -0.31 / 0.45 |
+  | 1M17, EGFR kinase + erlotinib | ligand RMSD | 0.79-0.82 Å | 0.92 Å | 0.98 Å |
+  | 1BRS, barnase-barstar | interface RMSD | 0.77-0.80 Å | 0.79 Å | 0.77 Å |
+
+  Protein CA-RMSD for 3HTB and 1BRS is 0.25-0.37 Å everywhere. For 1M17 the whole-chain CA-RMSD is
+  ~11.8 Å on every platform including CPU fp32: the model places the C-terminal tail differently from
+  the crystal (the rest of the chain is 0.1-1.0 Å), so it is a property of Boltz-2, not the port.
 - Boltz-2's diffusion is stochastic: two runs that differ only in the seed can differ by several Å.
   Compare structures against that spread, not against zero.
 
