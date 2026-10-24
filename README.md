@@ -133,7 +133,7 @@ warm:
 | input | tokens (padded) | ds=1 | ds=8 | ds=25 |
 |---|---:|---:|---:|---:|
 | PDB 3HTB (protein) | 192 | 14.2 s | | 33.8 s |
-| PDB 1M17 (protein) | 384 | 30.4 s | | 76.9 s |
+| PDB 1M17 (protein) | 352 | 30.4 s | | 76.9 s |
 | PDB 3W7T | 832 | 204.6 s | | does not fit |
 | PDB 6EA2 | 928 | 253.2 s | 333.1 s | does not fit |
 
