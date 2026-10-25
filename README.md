@@ -151,35 +151,52 @@ the Inferentia2 tables. Default: **LNC=2**, 4 logical NeuronCores of 24 GB each,
 
 | tokens | ds=1 | ds=8 | ds=25 |
 |---:|---:|---:|---:|
-| 64 | 4.1 | 7.6 | 8.0 |
-| 128 | 4.6 | 6.9 | 10.2 |
-| 192 | 7.5 | 10.5 | 16.9 |
-| 256 | 9.4 | 13.7 | 25.8 |
-| 384 | 16.7 | 23.3 | 49.8 |
-| 512 | 31.1 | 41.5 | 72.2 |
-| 640 | 54.9 | 73.7 | 117.5 * |
-| 960 | 145.2 | 186.0 | 292.3 |
-| 1,024 | 195.6 | 253.6 | |
-| 1,056 | 207.0 | 269.9 | |
+| 64 | 4.0 | 7.2 | 8.0 |
+| 128 | 4.5 | 8.6 | 10.0 |
+| 192 | 7.5 | 10.6 | 16.7 |
+| 256 | 9.4 | 13.8 | 25.8 |
+| 384 | 16.5 | 23.1 | 49.5 |
+| 512 | 31.1 | 41.5 | 66.5 ** |
+| 640 | 54.6 | 73.8 | 116.1 * |
+| 960 | 143.8 | 186.1 | 282.1 |
+| 1,024 | 201.8 | 258.1 |  |
+| 1,056 | 205.4 | 269.7 |  |
 
 ### Throughput: structures per second per Trainium2 device (4 workers, LNC=2)
 
 | tokens | ds=1 | ds=8 | ds=25 |
 |---:|---:|---:|---:|
-| 64 | 0.943 | 3.94 | 11.3 |
-| 128 | 0.859 | 4.29 | 8.91 |
-| 192 | 0.523 | 2.86 | 5.75 |
-| 256 | 0.423 | 2.26 | 3.81 |
-| 384 | 0.239 | 1.37 | 2.00 |
-| 512 | 0.129 | 0.767 | 1.38 |
-| 640 | 0.073 | 0.433 | 0.848 * |
+| 64 | 0.984 | 4.14 | 11.61 |
+| 128 | 0.889 | 3.53 | 9.14 |
+| 192 | 0.535 | 2.89 | 5.81 |
+| 256 | 0.427 | 2.26 | 3.85 |
+| 384 | 0.242 | 1.37 | 2.00 |
+| 512 | 0.129 | 0.764 | 1.49 ** |
+| 640 | 0.073 | 0.432 | 0.857 * |
 | 960 | 0.028 | 0.172 | 0.348 |
-| 1,024 | 0.020 | 0.127 | |
-| 1,056 | 0.019 | 0.119 | |
+| 1,024 | 0.020 | 0.124 |  |
+| 1,056 | 0.019 | 0.118 |  |
 
-\* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`. These LNC=2 timings were taken before the compiler fix
-below was added; with the fix, re-timed cells are unchanged (192 tokens: 7.44 / 10.54 / 16.58 s;
-512: 31.6 s; 960: 144.2 s).
+\* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`. \** 512 tokens x 25 samples (and other 448-576-token,
+ds >= 16 shapes) does not compile with the LNC=2 accuracy fix (`NCC_ILSA902` / `NCC_ITEN406`); set
+`BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1` there (runs the samples in chunks; 66.5 s). Measured with the
+shipped default (LNC=2 + the accuracy fix): same as without the fix within 4%, except 128 tokens x 8
+samples (8.6 s vs 6.8 s).
+
+### Inputs with an MSA (trn2, LNC=2)
+
+| input | tokens (padded) | ds=1 | ds=8 | ds=25 |
+|---|---:|---:|---:|---:|
+| PDB 3HTB (protein) | 192 | 7.8 s | | 17.6 s |
+| PDB 1M17 (protein) | 352 | 17.6 s | | |
+| PDB 3W7T | 832 | 106.3 s | | 211.4 s * |
+| PDB 6EA2 | 928 | 141.9 s | 184.0 s | 282.3 s * |
+
+### Larger trn2 instances
+
+Not measured. A trn2.48xlarge has 16 Trainium2 devices; with one worker per logical core expect about
+16x the per-device throughput above (inf2.24xlarge, measured, scales linearly with one worker per
+core).
 
 ### Input size limits (single protein chain, one worker)
 
@@ -197,11 +214,11 @@ retries allocations, which slows those runs.
 
 | tokens | single worker, LNC=2 / LNC=1 (s) | per device, LNC=2 / LNC=1 (structures/s, ds=1) |
 |---:|---|---|
-| 192 | 7.5 / 10.2 | 0.523 (4 workers) / 0.716 (8) |
+| 192 | 7.5 / 10.2 | 0.535 (4 workers) / 0.716 (8) |
 | 512 | 31.1 / 50.8 | 0.129 (4) / 0.142 (8) |
-| 640 | 54.9 / 94.9 | 0.073 (4) / 0.081 (8) |
-| 960 | 145.2 / 255.8 | 0.028 (4) / 0.016 (4) |
-| 1,056 | 207.0 / 366.7 | 0.019 (4) / 0.011 (4) |
+| 640 | 54.6 / 94.9 | 0.073 (4) / 0.081 (8) |
+| 960 | 143.8 / 255.8 | 0.028 (4) / 0.016 (4) |
+| 1,056 | 205.4 / 366.7 | 0.019 (4) / 0.011 (4) |
 
 LNC=2 (default) has the lowest latency, the largest inputs and, from ~700 tokens, the most throughput.
 Up to 640 tokens, `NEURON_LOGICAL_NC_CONFIG=1` (8 workers) gives 6-58% more structures per second per
