@@ -240,7 +240,8 @@ accuracy with no measurable speed cost: **0.61-0.92 Å, lDDT-CA 0.979-0.982** on
 - **Largest input: 1,056 tokens per Inferentia2 chip, 1,408 per Trainium2 logical core (LNC=2)**, at
   `--diffusion_samples 1`; lower with more samples (table in
   [Input size limits](#input-size-limits-single-protein-chain-one-worker)). On inf2, 1,088 tokens no
-  longer fits (it did with the Beta 5 build).
+  longer fits (it did with the Beta 5 build): the SDK 2.33 compiler reserves 52-78% more device scratch
+  for the diffusion model (measured on the same chip), which is also why 640-1,024 tokens are 3-5% slower.
 - **Cap the MSA above ~700 tokens.** The loaded MSA uses device memory. Use `--max_msa_seqs 2048`
   (Boltz-2 uses 1,024 MSA rows inside the model by default).
 - **Padding.** On Inferentia2, token counts that are not a multiple of 32 run up to 1.6x slower (one
