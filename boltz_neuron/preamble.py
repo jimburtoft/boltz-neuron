@@ -89,6 +89,9 @@ INSTANCE = _instance_type()
 if INSTANCE.startswith("trn2"):
     if os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2") == "2":
         os.environ.setdefault("BOLTZ_NEURON_ATOM_GRAPH_BREAK", "1")
+        # With the split, 512 tokens x 25 samples no longer compiles at LNC=2 (NCC_ILSA902); it does with
+        # BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1. That setting is NOT made the default here: below ~448 tokens it is
+        # 5-40% slower (64 tokens x 8 samples 10.6 vs 7.2 s). README: set it for 448-576 tokens at ds >= 16.
 
 import torch
 import torch.nn.functional as F
@@ -362,6 +365,38 @@ def _install_trainer_hook():
     _log("Trainer -> custom NeuronAccelerator + SingleDeviceStrategy(neuron) + precision=32-true")
 
 
+_FAST_INIT_STATE = None
+
+
+def _install_fast_init():
+    """Skip Boltz-2's random weight initialisation while a checkpoint is being loaded.
+
+    Building the model calls boltz.model.layers.initialize.trunc_normal_init_ for ~470 weight matrices,
+    each sampling scipy truncnorm on the CPU: ~16 s of a ~22 s checkpoint load, all overwritten by the
+    checkpoint immediately after (load_from_checkpoint uses strict=True, so every weight is replaced).
+    Inside load_from_checkpoint the init is a no-op; outside it (e.g. training) it is unchanged.
+    Disable with BOLTZ_NEURON_FAST_INIT=0.
+    """
+    if os.environ.get("BOLTZ_NEURON_FAST_INIT", "1") != "1":
+        return
+    try:
+        import boltz.model.layers.initialize as _init
+    except Exception as e:
+        _log(f"fast init skipped: {e!r}")
+        return
+    _orig = _init.trunc_normal_init_
+    _state = {"loading": 0}
+
+    def _trunc(weights, scale=1.0, fan="fan_in"):
+        if _state["loading"]:
+            return  # overwritten by the checkpoint
+        return _orig(weights, scale=scale, fan=fan)
+
+    _init.trunc_normal_init_ = _trunc
+    # the module-level helpers call trunc_normal_init_ through the module global, so they follow
+    return _state
+
+
 def _install_load_hook():
     """Wrap Boltz2.load_from_checkpoint: steering off, compile score_model, cast+move."""
     from boltz.main import Boltz2
@@ -379,7 +414,13 @@ def _install_load_hook():
         if isinstance(pa, dict) and pa:
             _log(f"predict_args: diffusion_samples={pa.get('diffusion_samples')} "
                  f"max_parallel_samples={pa.get('max_parallel_samples')}")
-        model = _orig_load(cls, *args, **kwargs)
+        if _FAST_INIT_STATE is not None and kwargs.get("strict", True):
+            _FAST_INIT_STATE["loading"] += 1
+        try:
+            model = _orig_load(cls, *args, **kwargs)
+        finally:
+            if _FAST_INIT_STATE is not None and kwargs.get("strict", True):
+                _FAST_INIT_STATE["loading"] -= 1
         model.eval()
         # compile_structure: wrap the diffusion score model with the neuron backend.
         if COMPILE_STRUCTURE and hasattr(model, "structure_module") and hasattr(model.structure_module, "score_model"):
@@ -455,5 +496,7 @@ def apply():
     _install_uid_wrap_hook()
     _install_writer_cpu_unpad()
     _install_trainer_hook()
+    global _FAST_INIT_STATE
+    _FAST_INIT_STATE = _install_fast_init()
     _install_load_hook()
     _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'on' if STEERING else 'off'} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')}")

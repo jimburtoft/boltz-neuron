@@ -45,6 +45,9 @@ column. Each fix is meant to be removed once the underlying Neuron issue is fixe
   a second model on a cropped complex in the same process; the compiled score model is created with
   `dynamic=False` so the new shape compiles once instead of failing with
   `SymIntArrayRef expected to contain only concrete integers`.
+- **Startup:** of a warm ~40 s command (192 tokens, trn2), ~4 s is imports, ~4 s checkpoint load, ~9-11 s
+  moving ~5,100 weight tensors to the device one by one, ~20 s prediction. `BOLTZ_NEURON_FAST_INIT=0`
+  restores Boltz-2's random init during loading (adds ~17 s).
 - **fk_steering is not validated** (supported, much slower on Inferentia2).
 - **Containers:** `BOLTZ_NEURON_VENV=system bash scripts/setup.sh` installs into the image's python
   (verified on `public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04`,

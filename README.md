@@ -115,7 +115,9 @@ at 640-1,024 tokens.
 
 One `boltz_neuron predict` command on a fresh inf2.xlarge after restoring the prebuilt cache,
 including model load and output writing: about 72 s for ds=1 and ds=8 and 93 s for ds=25 (24, 32
-and 52 s of that is the prediction itself). The first command after boot takes about 4 minutes
+and 52 s of that is the prediction itself). Since then the package skips Boltz-2's random weight
+initialisation during checkpoint loading (it is overwritten anyway), which removes ~17 s per command
+(measured on trn2: 57 s -> 39 s for the 192-token example; identical output). The first command after boot takes about 4 minutes
 (the DLAMI's packages load from disk for the first time). To process many inputs, pass a
 **directory** to one command: startup is paid once.
 
