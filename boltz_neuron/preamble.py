@@ -104,7 +104,14 @@ import torch.nn.functional as F
 PAD = int(os.environ.get("BOLTZ_NEURON_PAD", "32"))
 DTYPE = os.environ.get("BOLTZ_NEURON_DTYPE", "bf16")
 COMPILE_STRUCTURE = os.environ.get("BOLTZ_NEURON_COMPILE_STRUCTURE", "1") not in ("0", "false", "no")
-STEERING = os.environ.get("BOLTZ_NEURON_STEERING", "off") in ("on", "1", "true")
+_STEERING_MODE = os.environ.get("BOLTZ_NEURON_STEERING", "off").lower()
+# on / 1 / true: pass boltz's steering_args through unchanged (`--use_potentials` sets fk_steering and
+#   physical_guidance_update together).
+# nim: the NVIDIA Boltz-2 NIM's configuration -- fk_steering on, physical_guidance_update off,
+#   contact_guidance_update on -- so GPU-vs-Neuron comparisons run the same steering work. Boltz's CLI cannot
+#   express this combination.
+STEERING = _STEERING_MODE in ("on", "1", "true", "nim")
+STEERING_NIM = _STEERING_MODE == "nim"
 PAD_MAX_ADD = int(os.environ.get("BOLTZ_NEURON_PAD_MAX_ADD", "-1"))
 
 # WORKAROUND(trimul-shape): token counts at which the trunk's triangle-multiplication matmul
@@ -410,6 +417,12 @@ def _install_load_hook():
             if isinstance(sa, dict):
                 sa["fk_steering"] = False
                 sa["physical_guidance_update"] = False
+        elif sa is not None and STEERING_NIM and isinstance(sa, dict) and kwargs.get("affinity_mw_correction") is None:
+            # Structure model only (the affinity model is loaded with steering off by boltz; leave it).
+            sa["fk_steering"] = True
+            sa["physical_guidance_update"] = False
+            sa["contact_guidance_update"] = True
+            _log("steering: NIM preset (fk_steering=True, physical_guidance_update=False, contact_guidance_update=True)")
         pa = kwargs.get("predict_args") or {}
         if isinstance(pa, dict) and pa:
             _log(f"predict_args: diffusion_samples={pa.get('diffusion_samples')} "
@@ -499,4 +512,4 @@ def apply():
     global _FAST_INIT_STATE
     _FAST_INIT_STATE = _install_fast_init()
     _install_load_hook()
-    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'on' if STEERING else 'off'} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')}")
+    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'nim' if STEERING_NIM else ('on' if STEERING else 'off')} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')}")
