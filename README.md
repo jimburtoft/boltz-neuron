@@ -328,6 +328,7 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_DROP_DISTO` | `1` | drop a training-only feature before it reaches the device |
 | `BOLTZ_NEURON_WRITER_CPU` | `1` | remove padding from outputs on CPU |
 | `BOLTZ_NEURON_UID_WRAP` | `1` | keep residue ids exact in bf16 above 256 residues |
+| `BOLTZ_NEURON_STATIC_STEERING` | `1` | static-shape steering energy (`torch.where` instead of boolean-mask indexing; bit-exact). Without it every VDW energy call recompiles on Neuron |
 | `BOLTZ_NEURON_STEERING` | `off` | `on` passes boltz's steering flags through (`--use_potentials`: fk_steering + physical guidance); `nim` uses the NVIDIA Boltz-2 NIM's steering (fk_steering + contact guidance, no physical guidance update) for like-for-like GPU comparisons. Both are much slower on Neuron |
 
 Always pass `--num_workers 0`: it avoids a DataLoader timeout while a shape compiles.

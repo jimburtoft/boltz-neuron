@@ -1096,6 +1096,9 @@ def apply_patches(
                 "VDWOverlapPotential.pair_pad_mask -> gather-free prefix compare "
                 "(neuronx-cc remat_optimization hang workaround; bit-exact)")
 
+    if os.environ.get("BOLTZ_NEURON_STATIC_STEERING", "1") not in ("0", "false", "no") and _apply_flat_bottom_static_shape_patch():
+        installed["patches"].append("FlatBottomPotential.compute_function -> torch.where (static shapes; bit-exact)")
+
     if steering_potentials_dtype_fix and dtype != torch.float32:
         _pot_patched = _apply_steering_potentials_dtype_patch()
         if _pot_patched:
@@ -1325,6 +1328,64 @@ def _apply_pair_pad_mask_gather_workaround():
     cls.compute_args = compute_args
     patched.append("VDWOverlapPotential.compute_args")
     return patched
+
+
+def _apply_flat_bottom_static_shape_patch():
+    """FlatBottomPotential.compute_function without data-dependent shapes (bit-exact).
+
+    Stock boltz builds the energy with boolean-mask indexing, e.g.
+        energy[neg_overflow_mask] = (k * (lower_bounds - value))[neg_overflow_mask]
+    The masked tensors' sizes depend on how many pairs violate their bounds, which changes at every sampling step.
+    Run eagerly on Neuron, every distinct size is a new graph: with NIM steering on 8clz (N=682, 6.34M VDW pairs)
+    each VDWOverlapPotential.compute call compiled ~12 new NEFFs and took ~193 s (97% of the prediction, profiled
+    2026-10-26). torch.where gives the same values with fixed shapes (the two masks are disjoint, and where neither
+    holds the energy is 0, as in stock). The negation_mask bound swap is rewritten the same way.
+    """
+    try:
+        import boltz.model.potentials.potentials as P
+    except Exception:
+        return False
+    if getattr(P.FlatBottomPotential, "_bn_static_shape", False):
+        return True
+
+    def compute_function(self, value, k, lower_bounds, upper_bounds, negation_mask=None,
+                         compute_derivative=False):
+        if lower_bounds is None:
+            lower_bounds = torch.full_like(value, float("-inf"))
+        if upper_bounds is None:
+            upper_bounds = torch.full_like(value, float("inf"))
+        lower_bounds = lower_bounds.expand_as(value)
+        upper_bounds = upper_bounds.expand_as(value)
+
+        if negation_mask is not None:
+            unbounded_below_mask = torch.isneginf(lower_bounds)
+            unbounded_above_mask = torch.isposinf(upper_bounds)
+            unbounded_mask = unbounded_below_mask + unbounded_above_mask
+            assert torch.all(unbounded_mask + negation_mask)
+            neg = ~negation_mask
+            m_a = ~unbounded_above_mask * neg          # stock: lower <- upper, upper <- inf
+            m_b = ~unbounded_below_mask * neg          # stock: upper <- lower(after step a), lower <- -inf
+            inf = torch.full_like(value, float("inf"))
+            lb1 = torch.where(m_a, upper_bounds, lower_bounds)
+            ub1 = torch.where(m_a, inf, upper_bounds)
+            ub2 = torch.where(m_b, lb1, ub1)
+            lb2 = torch.where(m_b, -inf, lb1)
+            lower_bounds, upper_bounds = lb2, ub2
+
+        neg_overflow_mask = value < lower_bounds
+        pos_overflow_mask = value > upper_bounds
+        k_full = k.expand_as(value) if torch.is_tensor(k) else torch.full_like(value, k)
+        zero = torch.zeros_like(value)
+        energy = torch.where(neg_overflow_mask, k_full * (lower_bounds - value),
+                             torch.where(pos_overflow_mask, k_full * (value - upper_bounds), zero))
+        if not compute_derivative:
+            return energy
+        dEnergy = torch.where(neg_overflow_mask, -1 * k_full, torch.where(pos_overflow_mask, k_full, zero))
+        return energy, dEnergy
+
+    P.FlatBottomPotential.compute_function = compute_function
+    P.FlatBottomPotential._bn_static_shape = True
+    return True
 
 
 def _apply_steering_potentials_dtype_patch():
