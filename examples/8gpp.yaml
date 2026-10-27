@@ -1,0 +1,12 @@
+version: 1
+
+# Example input: PDB 8GPP (NVIDIA Boltz-2 NIM benchmark set)
+# NVIDIA expected N=628, our composition yields N=624
+# Source: https://www.rcsb.org/fasta/entry/8GPP
+# msa: empty -- single-sequence mode to isolate inference latency from MSA server variance
+
+sequences:
+  - protein:
+      id: [A, B, C]
+      sequence: MGHHHHHHPCYSIDGVIPVVSPDAFVHPTAVLIGDVIIEAGVYVGPFASLRADFGRIHINQNANIQDSCTVHGFPQSVTLVEEMGHIGHGAILHGCRIGKNVLVGMNSVILDYAEIGENTIIGANSLVKTKDIIPANVLAMGSPAKVARDLSEQEKKWKTRGTQEYMELAQRCLNSMQEVQPLSSESDDRLTYKDFSSSNYQIKQDSV
+      msa: empty
