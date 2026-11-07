@@ -1035,6 +1035,15 @@ def apply_patches(
         PairformerLayer.forward = _pairformer_layer_forward_clean
         installed["patches"].append("PairformerLayer.forward -> clean (no autocast, no .float())")
 
+    # --- K-24 triangle attention (opt-in) ---
+    if os.environ.get("BOLTZ_NEURON_TRI_ATTN", "stock").lower() == "k24":
+        from boltz.model.layers.triangular_attention.attention import TriangleAttention
+        from boltz_neuron import k24_tri_attn
+        if not hasattr(TriangleAttention, "_k24_stock_forward"):
+            TriangleAttention._k24_stock_forward = TriangleAttention.forward
+            TriangleAttention.forward = k24_tri_attn.forward
+        installed["patches"].append("TriangleAttention.forward -> K-24 NKI attention core (BOLTZ_NEURON_TRI_ATTN=k24)")
+
     # --- OuterProductMean ---
     if apply_opm:
         try:
