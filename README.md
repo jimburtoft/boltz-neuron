@@ -203,12 +203,27 @@ core).
 | instance | ds=1 | ds=8 | ds=25 |
 |---|---|---|---|
 | inf2 (one NeuronCore, 16 GB) | **1,056** (1,088 fails) | 960 (1,024 fails) | 640 * (960 not tested) |
-| **trn2, LNC=2** (default; one 24 GB logical core) | **1,408** (1,536 fails) | **1,280** (1,408 fails) | **960** (1,024 fails) |
+| **trn2, LNC=2** (default; one 24 GB logical core), one worker alone | **1,408** (1,440 fails) | **1,312** (1,344 fails) | **1,120** * (1,152 fails) |
+| **trn2, LNC=2, 4 workers per device** (all predictions succeed) | **1,408** | **1,152** (1,280: 2 of 4 workers fail) | **1,024** * (1,088: 1 of 4 workers fails on its 3rd prediction) |
 | trn2, LNC=1 (12 GB logical cores; one worker per HBM bank) | 1,280 (higher not tested) | 1,056 (higher not tested) | 960 (higher not tested) |
 
-"Fails" means the device memory runs out (`NRT_RESOURCE`). \* needs `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`.
-Deep MSAs lower these; use `--max_msa_seqs 2048` above ~700 tokens. Near the limits the runtime
-retries allocations, which slows those runs.
+"Fails" means the device memory runs out (`NRT_RESOURCE`). \* needs `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`
+(without it the ds=25 limit is 960). trn2 limits measured 2026-11-07 on synthetic single chains in
+steps of 32 tokens, no MSA, steering off. Within ~10% of the limit, a worker sometimes runs out of
+memory even when the same shape ran alone, or on an earlier prediction. Leave that margin when all four
+cores are busy. Deep MSAs lower these limits; use `--max_msa_seqs 2048` above ~700 tokens. Near the
+limits the runtime retries allocations, which slows those runs.
+
+**trn2 throughput at the largest sizes** (one device, 4 workers, LNC=2, 2 timed predictions per worker
+after a warm-up; 2026-11-07):
+
+| tokens | ds | seconds per prediction (slowest worker) | structures per second per device |
+|---:|---:|---:|---:|
+| 1,024 | 8 | 272.7 | 0.117 |
+| 1,152 | 8 | 298.4 | 0.107 |
+| 1,024 | 25 * | 421.0 | 0.238 |
+| 1,088 | 25 * | 544.7 | 0.184 (3 of 4 workers completed all predictions) |
+| 1,408 | 1 | 400.3 | 0.0100 |
 
 ### LNC=2 or LNC=1
 
@@ -238,7 +253,8 @@ accuracy with no measurable speed cost: **0.61-0.92 Å, lDDT-CA 0.979-0.982** on
 ## Input size and padding
 
 - **Largest input: 1,056 tokens per Inferentia2 chip, 1,408 per Trainium2 logical core (LNC=2)**, at
-  `--diffusion_samples 1`; lower with more samples (table in
+  `--diffusion_samples 1`; lower with more samples (trn2: 1,312 at ds=8, 1,120 at ds=25 with
+  `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`; table in
   [Input size limits](#input-size-limits-single-protein-chain-one-worker)). On inf2, 1,088 tokens no
   longer fits (it did with the Beta 5 build): the SDK 2.33 compiler reserves 52-78% more device scratch
   for the diffusion model (measured on the same chip), which is also why 640-1,024 tokens are 3-5% slower.
