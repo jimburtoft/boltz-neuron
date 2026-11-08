@@ -147,6 +147,44 @@ At ~200 tokens the MSA adds about 3.6 s per prediction; above ~350 tokens it add
 Measured on a **trn2.3xlarge** (one Trainium2 device), Neuron SDK 2.33, same settings and method as
 the Inferentia2 tables. Default: **LNC=2**, 4 logical NeuronCores of 24 GB each, one worker per core.
 
+### NKI triangle attention (default on trn2 at LNC=2)
+
+Triangle attention is 72-86% of the trunk's time on one trn2 core at 384-704 tokens. On trn2 at LNC=2 the
+package replaces its attention core with an NKI kernel (`boltz_neuron/k24_tri_attn.py`, built on a modified
+copy of the Neuron SDK's NKI Library `attention_cte`, vendored in `boltz_neuron/k24nkilib`).
+`BOLTZ_NEURON_TRI_ATTN=stock` turns it off. Measured 2026-11-07 (trn2.3xlarge, SDK 2.33):
+
+- **One module, one core, real Boltz-2 weights**: 1.8-1.9x faster than stock at 384 tokens, 2.7-3.0x at 544,
+  2.9-3.2x at 704, 3.5-3.7x at 1,024, 2.3-2.6x at 1,408. Its outputs are closer to fp32 than the stock bf16
+  path's (relative error 0.019-0.022 vs 0.023-0.026).
+- **Accuracy vs crystal** (MSA, two seeds): 3W7T 0.88 / 0.89 A (stock 0.92 / 0.88), 5A7M 0.61 / 0.61 A (stock
+  0.61 / 0.61), 6EA2 0.50 / 0.45 A (stock 0.48 / 0.50); lDDT-CA 0.980-0.996, the same as stock.
+- **Structures per second per device** (4 workers, no MSA):
+
+| input (tokens, padded) | ds=1 stock -> NKI | ds=8 stock -> NKI | ds=25 stock -> NKI |
+|---|---|---|---|
+| 8EIL (192) | 0.50 -> **0.70** | | 5.26 -> **6.41** |
+| 8C4D (352) | 0.23 -> **0.34** | 1.33 -> **1.81** | 1.96 -> **2.42** |
+| 8CPK (384) | 0.24 -> **0.33** | 1.33 -> **1.70** | 2.00 -> **2.37** |
+| 8ARE (544) | 0.083 -> **0.156** | 0.47 -> **0.81** | 0.92 -> **1.46** * |
+| 8OWF (576) | 0.078 -> **0.149** | 0.45 -> **0.79** | 0.87 -> **1.39** * |
+| 7TPU (640) | 0.072 -> **0.131** | 0.41 -> **0.67** | 0.79 -> **1.18** * |
+| 8GPP (640) | 0.073 -> **0.131** | 0.42 -> **0.68** | 0.79 -> **1.22** * |
+| 8CLZ (704) | 0.052 -> **0.108** | 0.31 -> **0.58** | 0.61 -> **1.05** * |
+
+Complexes: 3HTB (protein + ligand, with affinity) protein 0.37 A, ligand 0.33 A (stock 0.27 / 0.34 A), affinity
+-0.19 / P(binder) 0.40 (stock -0.22 / 0.44); 1BRS (protein-protein) interface RMSD 0.76 A (stock 0.79 A). The
+affinity module's pair mask (receptor x ligand) is not an outer product of a token mask, so its triangle
+attention keeps the stock path (logged once as "stock fallback"). The size limits are unchanged: they are set by
+device memory, not by triangle attention (1,440 tokens at ds=1 still runs out of memory).
+
+\* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`. The kernel compiles one graph per input size and node (start/end)
+the first time: about 10-30 s at 384 tokens, 80 s at 544, 110 s at 704, 220 s at 1,024 and 650 s at 1,408. The
+latency tables below are stock (measured before the kernel).
+
+The NKI Library code is licensed under the Apache License 2.0 (Copyright Amazon.com, Inc. or its affiliates);
+see the header of each vendored file.
+
 ### Latency: seconds per prediction, one logical NeuronCore (LNC=2)
 
 | tokens | ds=1 | ds=8 | ds=25 |
@@ -344,6 +382,8 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_DROP_DISTO` | `1` | drop a training-only feature before it reaches the device |
 | `BOLTZ_NEURON_WRITER_CPU` | `1` | remove padding from outputs on CPU |
 | `BOLTZ_NEURON_UID_WRAP` | `1` | keep residue ids exact in bf16 above 256 residues |
+| `BOLTZ_NEURON_TRI_ATTN` | `k24` on trn2 at LNC=2, else `stock` | `k24` = NKI triangle-attention core (see "NKI triangle attention"); `stock` = Boltz's PyTorch attention |
+| `BOLTZ_NEURON_K24_I_CHUNK` | `64` | pair rows per NKI kernel call |
 | `BOLTZ_NEURON_STATIC_STEERING` | `1` | static-shape steering energy (`torch.where` instead of boolean-mask indexing; bit-exact). Without it every VDW energy call recompiles on Neuron |
 | `BOLTZ_NEURON_STEERING` | `off` | `on` passes boltz's steering flags through (`--use_potentials`: fk_steering + physical guidance); `nim` uses the NVIDIA Boltz-2 NIM's steering (fk_steering + contact guidance, no physical guidance update) for like-for-like GPU comparisons. Both are much slower on Neuron |
 

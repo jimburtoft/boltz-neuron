@@ -89,6 +89,9 @@ INSTANCE = _instance_type()
 if INSTANCE.startswith("trn2"):
     if os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2") == "2":
         os.environ.setdefault("BOLTZ_NEURON_ATOM_GRAPH_BREAK", "1")
+        # K-24 NKI triangle attention: validated on trn2 at LNC=2 (accuracy vs crystal unchanged, 1.4-2.1x more
+        # structures/s at ds=1 for 384-682 tokens). Not tested on inf2 or at LNC=1. BOLTZ_NEURON_TRI_ATTN=stock disables.
+        os.environ.setdefault("BOLTZ_NEURON_TRI_ATTN", "k24")
         # With the split, 512 tokens x 25 samples no longer compiles at LNC=2 (NCC_ILSA902); it does with
         # BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1. That setting is NOT made the default here: below ~448 tokens it is
         # 5-40% slower (64 tokens x 8 samples 10.6 vs 7.2 s). README: set it for 448-576 tokens at ds >= 16.
@@ -512,4 +515,4 @@ def apply():
     global _FAST_INIT_STATE
     _FAST_INIT_STATE = _install_fast_init()
     _install_load_hook()
-    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'nim' if STEERING_NIM else ('on' if STEERING else 'off')} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')}")
+    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'nim' if STEERING_NIM else ('on' if STEERING else 'off')} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')} tri_attn={os.environ.get('BOLTZ_NEURON_TRI_ATTN', 'stock')}")

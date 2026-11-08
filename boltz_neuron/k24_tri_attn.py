@@ -89,6 +89,27 @@ def _forward_fn(x, mask, ln_w, ln_b, w_tri, w_q, w_k, w_v, w_g, w_o, starting: b
     return out
 
 
+_outer_cache = {}
+
+
+def _is_outer_product(mask):
+    """True if mask[0] == m_row[:, None] * m_col[None, :] for 0/1 vectors (Boltz's token pair mask). Cached per
+    tensor (all trunk/MSA/template/confidence layers share one mask tensor), so the device->host check runs once."""
+    # Keyed on the tensor object (kept alive by the cache, so its id cannot be reused). Masks are not modified in
+    # place in Boltz inference, and inference tensors have no version counter.
+    key = id(mask)
+    r = _outer_cache.get(key)
+    if r is None or r[1] is not mask:
+        m = mask[0].float()
+        r = bool(torch.equal(m, m.amax(1)[:, None] * m.amax(0)[None, :]))
+        # keep the tensor alive with its entry so its storage (and data_ptr) cannot be reused for another mask
+        r = (r, mask)
+        if len(_outer_cache) > 64:
+            _outer_cache.clear()
+        _outer_cache[key] = r
+    return r[0]
+
+
 def forward(self, x, mask=None, chunk_size=None, use_kernels=False):
     """Drop-in for TriangleAttention.forward on the neuron device (batch 1)."""
     if x.device.type != "neuron" or x.shape[0] != 1 or self.mha.linear_g is None:
@@ -96,9 +117,16 @@ def forward(self, x, mask=None, chunk_size=None, use_kernels=False):
         if CALLS["fallback"] == 1:
             print(f"[boltz-neuron] K-24 tri-attn: stock fallback (device={x.device.type}, batch={x.shape[0]})", flush=True)
         return self._k24_stock_forward(x, mask=mask, chunk_size=chunk_size, use_kernels=use_kernels)
-    CALLS["k24"] += 1
     if mask is None:
         mask = x.new_ones(x.shape[:-1])
+    elif not _is_outer_product(mask):
+        # e.g. the affinity module's receptor/ligand cross mask: the key mask depends on the row, so it cannot be
+        # folded into the shared per-head bias. Use stock attention for those modules.
+        CALLS["fallback"] += 1
+        if CALLS["fallback"] == 1:
+            print("[boltz-neuron] K-24 tri-attn: stock fallback (pair mask is not an outer product)", flush=True)
+        return self._k24_stock_forward(x, mask=mask, chunk_size=chunk_size, use_kernels=use_kernels)
+    CALLS["k24"] += 1
     key = (bool(self.starting), tuple(x.shape), x.dtype)
     fn = _compiled.get(key)
     if fn is None:
