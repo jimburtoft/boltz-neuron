@@ -384,6 +384,7 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_UID_WRAP` | `1` | keep residue ids exact in bf16 above 256 residues |
 | `BOLTZ_NEURON_TRI_ATTN` | `k24` on trn2 at LNC=2, else `stock` | `k24` = NKI triangle-attention core (see "NKI triangle attention"); `stock` = Boltz's PyTorch attention |
 | `BOLTZ_NEURON_K24_I_CHUNK` | `64` | pair rows per NKI kernel call |
+| `BOLTZ_NEURON_K24_BIAS` | `bf16` | `hilo` = carry the triangle bias at ~fp32 precision (two bf16 parts). Attention-core error 4.5x lower, module error ~3% lower, structures unchanged, ~7% slower |
 | `BOLTZ_NEURON_STATIC_STEERING` | `1` | static-shape steering energy (`torch.where` instead of boolean-mask indexing; bit-exact). Without it every VDW energy call recompiles on Neuron |
 | `BOLTZ_NEURON_STEERING` | `off` | `on` passes boltz's steering flags through (`--use_potentials`: fk_steering + physical guidance); `nim` uses the NVIDIA Boltz-2 NIM's steering (fk_steering + contact guidance, no physical guidance update) for like-for-like GPU comparisons. Both are much slower on Neuron |
 

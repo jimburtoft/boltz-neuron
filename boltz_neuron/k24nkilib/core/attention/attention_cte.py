@@ -239,6 +239,7 @@ def attention_cte(
     bias_band_params: Optional[dict] = None,
     allow_vector_exp: bool = True,
     bias_heads: int = 0,
+    position_bias_lo: Optional[nl.NkiTensor] = None,
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
 
@@ -459,6 +460,7 @@ def attention_cte(
         bias_band_params=bias_band_params,
         allow_vector_exp=allow_vector_exp,
         bias_heads=bias_heads,
+        position_bias_lo=position_bias_lo,
     )
 
 
@@ -514,6 +516,7 @@ def _attention_cte(
     kvp_seg_block_offset_int: int = 0,
     allow_vector_exp: bool = True,
     bias_heads: int = 0,
+    position_bias_lo: Optional[nl.NkiTensor] = None,
 ):
     """Internal attention implementation with full parameter set including SBUF I/O.
 
@@ -962,6 +965,7 @@ def _attention_cte(
     # K-24: resident per-head bias cache. Batch order must be b = h * I_per + i (head-major), so consecutive
     # batches share a head and the [Sq, Sk] bias of that head is loaded into SBUF once per head per core.
     k24_cache = None
+    k24_cache_lo = None
     k24_i_per = 0
     k24_sbuf_addr = init_sbuf_addr
     if position_bias is not None and bias_heads:
@@ -972,6 +976,13 @@ def _attention_cte(
         k24_cache = nl.ndarray((nl.tile_size.pmax, _k24_grps, _k24_sk), dtype=nl.bfloat16, buffer=nl.sbuf,
                                address=(0, init_sbuf_addr))
         k24_sbuf_addr = init_sbuf_addr + align_to(_k24_grps * _k24_sk * 2, 64)
+        if position_bias_lo is not None:
+            kernel_assert(_K24_BIAS_MODE == "pe", "K-24: position_bias_lo needs BOLTZ_NEURON_K24_BIAS_MODE=pe")
+            # K-24 hi/lo bias: second bf16 cache holding bf16(bias - bf16(bias)); both enter fp32 PSUM through
+            # identity matmuls, so the bias reaches the scores at ~fp32 precision instead of bf16.
+            k24_cache_lo = nl.ndarray((nl.tile_size.pmax, _k24_grps, _k24_sk), dtype=nl.bfloat16, buffer=nl.sbuf,
+                                      address=(0, k24_sbuf_addr))
+            k24_sbuf_addr = k24_sbuf_addr + align_to(_k24_grps * _k24_sk * 2, 64)
 
     for batch_idx in range(num_bs_per_shard):
         # When using SBUF KV (from segmented_cte):
@@ -1008,6 +1019,8 @@ def _attention_cte(
             k_scale_sb=k_scale_sb,
             kv_used_len=kv_used_len,
             k24_cache=k24_cache,
+            k24_cache_lo=k24_cache_lo,
+            position_bias_lo=position_bias_lo,
             k24_load=(k24_cache is not None and (batch_idx == 0 or batch_id % k24_i_per == 0)),
             k24_head=(batch_id // k24_i_per) if k24_cache is not None else 0,
         )
@@ -1205,6 +1218,8 @@ def _attention_cte_impl(
     k_scale_sb=None,
     kv_used_len: Optional[nl.NkiTensor] = None,
     k24_cache=None,
+    k24_cache_lo=None,
+    position_bias_lo=None,
     k24_load: bool = False,
     k24_head: int = 0,
 ):
@@ -1271,6 +1286,7 @@ def _attention_cte_impl(
     bufs = AttnInternalBuffers()
     bufs.k_scale_sb = k_scale_sb
     bufs.k24_cache = k24_cache
+    bufs.k24_cache_lo = k24_cache_lo
     bufs.k24_head = k24_head
     if k24_cache is not None and k24_load:
         # load head k24_head's full [Sq, Sk] bias into the resident cache: [p, grp, k] <- bias[h, grp*128 + p, k]
@@ -1280,6 +1296,9 @@ def _attention_cte_impl(
             _np = min(nl.tile_size.pmax, _sq - _g * nl.tile_size.pmax)
             nisa.dma_copy(dst=k24_cache[:_np, _g, :_sk],
                           src=position_bias[k24_head, _g * nl.tile_size.pmax : _g * nl.tile_size.pmax + _np, :_sk])
+            if k24_cache_lo is not None:
+                nisa.dma_copy(dst=k24_cache_lo[:_np, _g, :_sk],
+                              src=position_bias_lo[k24_head, _g * nl.tile_size.pmax : _g * nl.tile_size.pmax + _np, :_sk])
 
     # Write softmax intermediates
 
@@ -1605,6 +1624,7 @@ class AttnInternalBuffers(nl.NKIObject):
 
     # Position bias
     k24_cache = None  # K-24 resident per-head bias [128, num_grps, Sk] bf16
+    k24_cache_lo = None  # K-24 optional low part (hi/lo split) of the same bias
     k24_head = 0
     position_bias_sb = None  # SBUF tile used to stage [sb_p, _K_TILE_SZ] bias slices before PSUM preload
     position_bias_hbm = None  # Reference to the HBM position bias tensor (dense or banded)
@@ -4189,6 +4209,13 @@ def _qk_and_max_large_tile_impl(
                 accumulate=False,
             )
             use_accumulate = True
+            if bufs.k24_cache_lo is not None:
+                nisa.nc_matmul(
+                    mm1_psum_tile[:num_p, :num_f],
+                    _ident[:num_p, :num_p],
+                    bufs.k24_cache_lo[:num_p, qkmax_grp, nl.ds(abs_k_pos, num_f)],
+                    accumulate=True,
+                )
 
         for d_tile in range(atp.num_d_tiles):
             d_chunk = min(atp.d_tile_size_par_dim, ac.d - d_tile * atp.d_tile_size_par_dim)

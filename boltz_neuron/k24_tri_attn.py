@@ -30,6 +30,12 @@ import torch
 
 LNC = int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
 I_CHUNK = int(os.environ.get("BOLTZ_NEURON_K24_I_CHUNK", "64"))  # rows i per kernel call
+# Bias precision. "bf16" (default): one bf16 copy of the bias. "hilo": the bias is split into two bf16 parts (hi + lo)
+# that both enter the fp32 PSUM, so it reaches the scores at ~fp32 precision. Measured on trn2 (2026-11-09): hilo cuts
+# the attention-core error 4.5x (rel 0.0081 -> 0.0018 vs fp64), but the module error only 2-5% (0.0195 -> 0.0191:
+# the bf16 LayerNorm/projections/inputs dominate), crystal RMSD is unchanged, and it costs 7-12% per module (7% E2E).
+BIAS_PREC = os.environ.get("BOLTZ_NEURON_K24_BIAS", "bf16").lower()
+SPLIT = os.environ.get("BOLTZ_NEURON_K24_SPLIT", "veltkamp").lower()
 
 _cte = None
 _compiled = {}
@@ -49,14 +55,28 @@ def _core(q, k, v, bias, scale):
     """q, k, v: [I, H, J, D] (q unscaled); bias [H, J, J] fp32 incl. key mask. -> o [I, H, J, D]."""
     I, H, J, D = q.shape
     cte = _kernel()[LNC]
-    pb = (bias / scale).to(torch.float32).contiguous()   # kernel computes scale * (QK + bias)
+    pb = (bias / scale).to(torch.float32)               # kernel computes scale * (QK + bias)
+    kw = {}
+    if BIAS_PREC == "hilo":
+        # hi = exactly bf16-representable part of the fp32 bias; lo = the remainder (stored bf16 by the kernel).
+        # NOT a bf16 round trip: neuronx-cc folds fp32->bf16->fp32 into a no-op inside a compiled graph, which
+        # silently made lo == 0 (measured).
+        pb = pb.contiguous()
+        if SPLIT == "bitmask":
+            hi = (pb.view(torch.int32) & -65536).view(torch.float32)
+        else:   # Veltkamp split (C = 2^16 + 1): plain fp32 arithmetic, hi keeps the top 8 mantissa bits (bf16-exact)
+            c = pb * 65537.0
+            hi = c - (c - pb)
+        kw["position_bias_lo"] = (pb - hi).contiguous()
+        pb = hi
+    pb = pb.contiguous()
     outs = []
     for i0 in range(0, I, I_CHUNK):
         i1 = min(I, i0 + I_CHUNK)
         qb = q[i0:i1].transpose(0, 1).reshape(-1, J, D).contiguous()                 # head-major batch
         kb = k[i0:i1].transpose(0, 1).reshape(-1, J, D).transpose(1, 2).contiguous()
         vb = v[i0:i1].transpose(0, 1).reshape(-1, J, D).contiguous()
-        o = cte(qb, kb, vb, scale=scale, causal_mask=False, tp_q=True, tp_k=False, position_bias=pb, bias_heads=H)
+        o = cte(qb, kb, vb, scale=scale, causal_mask=False, tp_q=True, tp_k=False, position_bias=pb, bias_heads=H, **kw)
         outs.append(o.reshape(H, i1 - i0, J, D).transpose(0, 1))
     return torch.cat(outs, 0) if len(outs) > 1 else outs[0]
 
@@ -69,7 +89,7 @@ def _forward_fn(x, mask, ln_w, ln_b, w_tri, w_q, w_k, w_v, w_g, w_o, starting: b
     x = torch.nn.functional.layer_norm(x, (x.shape[-1],), ln_w.to(x.dtype), ln_b.to(x.dtype), 1e-5)
     x0 = x[0]
     I, J = x0.shape[0], x0.shape[1]
-    tri = torch.nn.functional.linear(x0, w_tri).permute(2, 0, 1)        # [H, J, J]
+    tri = torch.nn.functional.linear(x0, w_tri).permute(2, 0, 1)        # [H, J, J] (bf16, as stock)
     m = mask[0]
     m_tok = m.amax(0)
     real_rows = m.amax(1) > 0
