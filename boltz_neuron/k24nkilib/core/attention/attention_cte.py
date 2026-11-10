@@ -165,6 +165,11 @@ Kernel constraints (based on tested range, values outside range might work in pr
 """
 _MAX_BS = 512  # max tested batch size
 import os as _os
+_K24_DGE = {"sw": nisa.dge_mode.swdge, "hw": nisa.dge_mode.hwdge, "none": nisa.dge_mode.none}.get(
+    _os.environ.get("BOLTZ_NEURON_K24_DGE", "auto"), None)  # K-25 O2: DMA descriptor mode for K/V loads + O store
+_K24_PT = _os.environ.get("BOLTZ_NEURON_K24_PT", "dma")  # K-25 O3: P^T via dma_transpose (stock) or pe (nc_transpose)
+_K24_QK_ROWTILE = _os.environ.get("BOLTZ_NEURON_K24_QK_ROWTILE", "0") == "1"  # K-25 O5
+_K24_ROWMAX = _os.environ.get("BOLTZ_NEURON_K24_ROWMAX", "vector")  # K-25 O4: row-max evict on vector (stock) or scalar
 _K24_BIAS_MODE = _os.environ.get("BOLTZ_NEURON_K24_BIAS_MODE", "pe")  # K-24: pe (identity-matmul PSUM init) | evict (DVE add) | preload (stock nkilib, UB on NC-v3)
 _MAX_SEQLEN = 131072  # seqlen above this logs a warning (kernel handles arbitrary seqlen via tiling)
 _MAX_BS_TIMES_SEQLEN_QK = 32.0 * 36864 * 36864  # max tested bs*seqlen_q*seqlen_k
@@ -240,6 +245,8 @@ def attention_cte(
     allow_vector_exp: bool = True,
     bias_heads: int = 0,
     position_bias_lo: Optional[nl.NkiTensor] = None,
+    k24_dge: str = "auto",
+    k24_pt: str = "dma",
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
 
@@ -431,6 +438,10 @@ def attention_cte(
       ```
 
     """
+    # K-25 trace-time options (kernel kwargs so they are part of the compile cache key)
+    global _K24_DGE, _K24_PT
+    _K24_DGE = {"sw": nisa.dge_mode.swdge, "hw": nisa.dge_mode.hwdge, "none": nisa.dge_mode.none}.get(k24_dge, None)
+    _K24_PT = k24_pt
     return _attention_cte(
         q=q,
         k=k,
@@ -2992,7 +3003,10 @@ def _load_k_tile(
                             offset=batch_id * actual_d * seqlen + d_offset * seqlen + seqlen_offset,
                         )
 
-                        nisa.dma_copy(dst=out_dst_pat, src=k_src_pat)
+                        if _K24_DGE is not None:
+                            nisa.dma_copy(dst=out_dst_pat, src=k_src_pat, dge_mode=_K24_DGE)
+                        else:
+                            nisa.dma_copy(dst=out_dst_pat, src=k_src_pat)
 
     return sbuf_addr_max
 
@@ -3064,7 +3078,10 @@ def _load_v_tile(
                         pattern=[[actual_d, num_p], [1, d]],
                         offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
                     )
-                nisa.dma_copy(dst=out_dst_pat, src=v_src_pat)
+                if _K24_DGE is not None and load_offset is None:
+                    nisa.dma_copy(dst=out_dst_pat, src=v_src_pat, dge_mode=_K24_DGE)
+                else:
+                    nisa.dma_copy(dst=out_dst_pat, src=v_src_pat)
 
     return local_allocator.get_current_address()
 
@@ -3474,6 +3491,26 @@ def _exp_impl(
 
             # NOTE: we add the [1,1] because we need 4 dims for dma_transpose
 
+            if _K24_PT == "pe":
+                # K-25 O3: P^T on the PE: one nc_transpose per 128-key block into PSUM (bf16 dst on gen3), then one
+                # copy to SBUF. exp_sb rows = q (num_p), cols = keys; exp_tp_sb[k_in_blk, blk*128 + q].
+                _nblk = div_ceil(num_f, atp.sb_p)
+                _tp_ps = nl.ndarray((atp.sb_p, atp.mm2_grp_sz), dtype=nl.bfloat16, buffer=nl.psum)
+                for _b in range(_nblk):
+                    _nk = min(atp.sb_p, num_f - _b * atp.sb_p)
+                    nisa.nc_transpose(
+                        _tp_ps[:_nk, nl.ds(_b * atp.sb_p, num_p)],
+                        bufs.exp_sb[grp_i][large_tile_idx][:num_p, nl.ds(exp_tile_idx * atp.exp_inst_elems + _b * atp.sb_p, _nk)],
+                    )
+                for _b in range(_nblk):
+                    _nk = min(atp.sb_p, num_f - _b * atp.sb_p)
+                    nisa.tensor_copy(
+                        dst=bufs.exp_tp_sb[grp_i][large_tile_idx][exp_tile_idx][:_nk, nl.ds(_b * atp.sb_p, num_p)],
+                        src=_tp_ps[:_nk, nl.ds(_b * atp.sb_p, num_p)],
+                        engine=nisa.scalar_engine if (_b % 2) else nisa.vector_engine,
+                    )
+                continue
+
             # Case 1: handle 0:128x
             if num_f_outer >= 1:
                 nisa.dma_transpose(
@@ -3828,7 +3865,10 @@ def _write_back_o_impl(src_bufs, grp_i, ac: AttnConfig, atp: AttnTileParams, o, 
                 offset=batch_id * ac.seqlen_q * ac.d_v + grp_i * atp.sb_p * ac.d_v + d_offset,
             )
             src_pat = src_buf.ap(pattern=[[d, num_p], [1, d]], offset=0)
-        nisa.dma_copy(dst=o_dst_pat, src=src_pat)
+        if _K24_DGE is not None:
+            nisa.dma_copy(dst=o_dst_pat, src=src_pat, dge_mode=_K24_DGE)
+        else:
+            nisa.dma_copy(dst=o_dst_pat, src=src_pat)
 
 
 def _load_position_bias_tile(
@@ -4133,7 +4173,7 @@ def _qk_and_max_large_tile_impl(
     # element than nisa.tensor_scalar_reduce for a PSUM read + scale + fused max, so moving the evict
     # to Scalar is slower even where Scalar is otherwise free. The placement logic is retained in
     # _row_max_on_scalar and the chaining below is engine-independent; only the engine choice is off.
-    use_scalar_row_max = False
+    use_scalar_row_max = _K24_ROWMAX == "scalar"
     row_max_chains = _row_max_chain_endpoints(k_tile_selections, ac, atp, qkmax_grp, use_scalar_row_max)
     for k_tile_idx in range(_NUM_K_TILES_IN_LARGE_TILE):
         tile, should_process = k_tile_selections[k_tile_idx]
@@ -4219,6 +4259,11 @@ def _qk_and_max_large_tile_impl(
 
         for d_tile in range(atp.num_d_tiles):
             d_chunk = min(atp.d_tile_size_par_dim, ac.d - d_tile * atp.d_tile_size_par_dim)
+            _qk_kw = {}
+            if _K24_QK_ROWTILE and d_chunk <= 64:
+                # K-25 O5: tell the PE the contraction only uses d_chunk (32/64) rows
+                _rows = 32 if d_chunk <= 32 else 64
+                _qk_kw = {"tile_position": (0, 0), "tile_size": (_rows, 128)}
             nisa.nc_matmul(
                 mm1_psum_tile[:num_p, :num_f],
                 bufs.q_sb[qkmax_grp // atp.num_q_grps_per_load][d_tile][
@@ -4227,6 +4272,7 @@ def _qk_and_max_large_tile_impl(
                 ],
                 k_tile_to_use[d_tile][:d_chunk, :num_f],
                 accumulate=True if use_accumulate else None,
+                **_qk_kw,
             )
 
         # Step 3: Masking + scale + max reduce (unchanged from no-bias path)

@@ -36,6 +36,14 @@ I_CHUNK = int(os.environ.get("BOLTZ_NEURON_K24_I_CHUNK", "64"))  # rows i per ke
 # the bf16 LayerNorm/projections/inputs dominate), crystal RMSD is unchanged, and it costs 7-12% per module (7% E2E).
 BIAS_PREC = os.environ.get("BOLTZ_NEURON_K24_BIAS", "bf16").lower()
 SPLIT = os.environ.get("BOLTZ_NEURON_K24_SPLIT", "veltkamp").lower()
+# tp_out: kernel writes O^T [B, D, J]; PV then runs with V stationary and P^T moving (N = 128 query columns instead
+# of N = D = 32), at the cost of a transpose back in torch.
+TP_OUT = os.environ.get("BOLTZ_NEURON_K24_TPOUT", "0") == "1"
+# K-25 (2026-11-10, trn2 LNC=2, on-core per 64-row call): static DMA descriptors for K/V/O (dge "none") take GpSimd
+# from ~75% to ~10% busy and the kernel 1-14% faster (N=384 1.23 vs 1.25 ms, 1,024 3.00 vs 3.48, 1,408 5.35 vs 5.60);
+# module 5-10% faster at 704-1,024. PE-side P^T transpose (BOLTZ_NEURON_K24_PT=pe) is 27% faster on-core at N<=544
+# but does not show at module level (+0-11%) and is 11-32% slower at N>=704, so it is off by default.
+_PT_PE_MAX_N = int(os.environ.get("BOLTZ_NEURON_K24_PT_PE_MAX_N", "0"))
 
 _cte = None
 _compiled = {}
@@ -51,12 +59,19 @@ def _kernel():
     return _cte
 
 
+def _kernel_opts(J):
+    """K-25 kernel options for a sequence length J (passed as kernel kwargs, so they are in the compile cache key)."""
+    dge = os.environ.get("BOLTZ_NEURON_K24_DGE", "none")
+    pt = os.environ.get("BOLTZ_NEURON_K24_PT") or ("pe" if J <= _PT_PE_MAX_N else "dma")
+    return {"k24_dge": dge, "k24_pt": pt}
+
+
 def _core(q, k, v, bias, scale):
     """q, k, v: [I, H, J, D] (q unscaled); bias [H, J, J] fp32 incl. key mask. -> o [I, H, J, D]."""
     I, H, J, D = q.shape
     cte = _kernel()[LNC]
+    kw = _kernel_opts(J)
     pb = (bias / scale).to(torch.float32)               # kernel computes scale * (QK + bias)
-    kw = {}
     if BIAS_PREC == "hilo":
         # hi = exactly bf16-representable part of the fp32 bias; lo = the remainder (stored bf16 by the kernel).
         # NOT a bf16 round trip: neuronx-cc folds fp32->bf16->fp32 into a no-op inside a compiled graph, which
@@ -76,7 +91,10 @@ def _core(q, k, v, bias, scale):
         qb = q[i0:i1].transpose(0, 1).reshape(-1, J, D).contiguous()                 # head-major batch
         kb = k[i0:i1].transpose(0, 1).reshape(-1, J, D).transpose(1, 2).contiguous()
         vb = v[i0:i1].transpose(0, 1).reshape(-1, J, D).contiguous()
-        o = cte(qb, kb, vb, scale=scale, causal_mask=False, tp_q=True, tp_k=False, position_bias=pb, bias_heads=H, **kw)
+        o = cte(qb, kb, vb, scale=scale, causal_mask=False, tp_q=True, tp_k=False, tp_out=TP_OUT,
+                position_bias=pb, bias_heads=H, **kw)
+        if TP_OUT:
+            o = o.transpose(1, 2)
         outs.append(o.reshape(H, i1 - i0, J, D).transpose(0, 1))
     return torch.cat(outs, 0) if len(outs) > 1 else outs[0]
 

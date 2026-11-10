@@ -178,6 +178,10 @@ affinity module's pair mask (receptor x ligand) is not an outer product of a tok
 attention keeps the stock path (logged once as "stock fallback"). The size limits are unchanged: they are set by
 device memory, not by triangle attention (1,440 tokens at ds=1 still runs out of memory).
 
+Since 2026-11-10 the kernel uses static DMA descriptors for its K/V/output transfers: 0.4-3.2% more structures per
+hour on top of the table above (8CPK ds=1 0.340, 8ARE ds=1 0.159, 8CLZ ds=1 0.111 / ds=8 0.586 / ds=25 1.075, 8EIL
+ds=25 6.44 structures/s), same predicted structures.
+
 \* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`. The kernel compiles one graph per input size and node (start/end)
 the first time: about 10-30 s at 384 tokens, 80 s at 544, 110 s at 704, 220 s at 1,024 and 650 s at 1,408. The
 latency tables below are stock (measured before the kernel).
@@ -385,6 +389,8 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_TRI_ATTN` | `k24` on trn2 at LNC=2, else `stock` | `k24` = NKI triangle-attention core (see "NKI triangle attention"); `stock` = Boltz's PyTorch attention |
 | `BOLTZ_NEURON_K24_I_CHUNK` | `64` | pair rows per NKI kernel call |
 | `BOLTZ_NEURON_K24_BIAS` | `bf16` | `hilo` = carry the triangle bias at ~fp32 precision (two bf16 parts). Attention-core error 4.5x lower, module error ~3% lower, structures unchanged, ~7% slower |
+| `BOLTZ_NEURON_K24_DGE` | `none` | DMA descriptor mode for the kernel's K/V/output transfers (`none` = static descriptors, frees the GpSimd engine; `sw` = the NKI Library default) |
+| `BOLTZ_NEURON_K24_PT` | `dma` | engine for the kernel's P transpose (`pe` is faster on-core at <= 544 tokens, slower above; no module-level gain measured) |
 | `BOLTZ_NEURON_STATIC_STEERING` | `1` | static-shape steering energy (`torch.where` instead of boolean-mask indexing; bit-exact). Without it every VDW energy call recompiles on Neuron |
 | `BOLTZ_NEURON_STEERING` | `off` | `on` passes boltz's steering flags through (`--use_potentials`: fk_steering + physical guidance); `nim` uses the NVIDIA Boltz-2 NIM's steering (fk_steering + contact guidance, no physical guidance update) for like-for-like GPU comparisons. Both are much slower on Neuron |
 
