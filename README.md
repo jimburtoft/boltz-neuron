@@ -186,6 +186,10 @@ ds=25 6.44 structures/s), same predicted structures.
 the first time: about 10-30 s at 384 tokens, 80 s at 544, 110 s at 704, 220 s at 1,024 and 650 s at 1,408. The
 latency tables below are stock (measured before the kernel).
 
+The same kernel is published as a standalone Hugging Face Kernel Hub package,
+[`jburtoft/triangle-attention-neuron-kernels`](https://huggingface.co/kernels/jburtoft/triangle-attention-neuron-kernels)
+(`get_kernel(..., version=1)`, `patch_boltz()`), for use outside this package.
+
 The NKI Library code is licensed under the Apache License 2.0 (Copyright Amazon.com, Inc. or its affiliates);
 see the header of each vendored file.
 
