@@ -182,9 +182,28 @@ Since 2026-11-10 the kernel uses static DMA descriptors for its K/V/output trans
 hour on top of the table above (8CPK ds=1 0.340, 8ARE ds=1 0.159, 8CLZ ds=1 0.111 / ds=8 0.586 / ds=25 1.075, 8EIL
 ds=25 6.44 structures/s), same predicted structures.
 
-\* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`. The kernel compiles one graph per input size and node (start/end)
+\* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1` (now the trn2 default). The kernel compiles one graph per input size and node (start/end)
 the first time: about 10-30 s at 384 tokens, 80 s at 544, 110 s at 704, 220 s at 1,024 and 650 s at 1,408. The
 latency tables below are stock (measured before the kernel).
+
+### Samples per diffusion call (default on trn2 at LNC=2)
+
+With `--diffusion_samples 25` stock Boltz runs all 25 samples through each diffusion step in one call. Above ~300
+tokens that call no longer fits on chip and the attention scores go through device memory. On trn2 the package
+now runs 5 samples per call for inputs of 288 tokens or more (at 16 samples or more) and the full batch below.
+Structures per hour, one device, 4 workers, 2026-11-11:
+
+| input (tokens, padded) | ds | all in one call (before) | 5 per call (now) | 1 per call |
+|---|---:|---:|---:|---:|
+| 8EIL (192) | 25 | **23,062** (kept) | 20,785 | 10,695 |
+| 8C4D (352) | 25 | 8,751 | **11,194** | |
+| 8CPK (384) | 25 | 8,551 | **10,490** | 8,962 |
+| 8ARE (544) | 25 | 4,526 | **5,414** | 4,830 |
+| 8CLZ (704) | 25 | out of memory | **3,818** | 3,528 |
+
+With the new defaults and no flags: 8EIL 22,727, 8C4D 10,616, 8CPK 10,280, 8CLZ 3,687 structures/hour. At 8
+samples the choice is within ~5%, so `--max_parallel_samples` is used as given. The noise is drawn for all samples
+up front, so the samples are the same; the outputs differ from the one-call run only by bf16 rounding.
 
 The same kernel is published as a standalone Hugging Face Kernel Hub package,
 [`jburtoft/triangle-attention-neuron-kernels`](https://huggingface.co/kernels/jburtoft/triangle-attention-neuron-kernels)
@@ -254,7 +273,7 @@ core).
 | trn2, LNC=1 (12 GB logical cores; one worker per HBM bank) | 1,280 (higher not tested) | 1,056 (higher not tested) | 960 (higher not tested) |
 
 "Fails" means the device memory runs out (`NRT_RESOURCE`). \* needs `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`
-(without it the ds=25 limit is 960). trn2 limits measured 2026-11-07 on synthetic single chains in
+(the trn2 default since 2026-11-11; without it the ds=25 limit is 960). trn2 limits measured 2026-11-07 on synthetic single chains in
 steps of 32 tokens, no MSA, steering off. Within ~10% of the limit, a worker sometimes runs out of
 memory even when the same shape ran alone, or on an earlier prediction. Leave that margin when all four
 cores are busy. Deep MSAs lower these limits; use `--max_msa_seqs 2048` above ~700 tokens. Near the
@@ -299,8 +318,8 @@ accuracy with no measurable speed cost: **0.61-0.92 Å, lDDT-CA 0.979-0.982** on
 ## Input size and padding
 
 - **Largest input: 1,056 tokens per Inferentia2 chip, 1,408 per Trainium2 logical core (LNC=2)**, at
-  `--diffusion_samples 1`; lower with more samples (trn2: 1,312 at ds=8, 1,120 at ds=25 with
-  `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`; table in
+  `--diffusion_samples 1`; lower with more samples (trn2: 1,312 at ds=8, 1,120 at ds=25 with the
+  default samples-per-call cap; table in
   [Input size limits](#input-size-limits-single-protein-chain-one-worker)). On inf2, 1,088 tokens no
   longer fits (it did with the Beta 5 build): the SDK 2.33 compiler reserves 52-78% more device scratch
   for the diffusion model (measured on the same chip), which is also why 640-1,024 tokens are 3-5% slower.
@@ -390,6 +409,8 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_DROP_DISTO` | `1` | drop a training-only feature before it reaches the device |
 | `BOLTZ_NEURON_WRITER_CPU` | `1` | remove padding from outputs on CPU |
 | `BOLTZ_NEURON_UID_WRAP` | `1` | keep residue ids exact in bf16 above 256 residues |
+| `BOLTZ_FIX_MAX_PARALLEL_SAMPLES` | `1` on trn2 at LNC=2, else unset | `--max_parallel_samples` is a cap on samples per diffusion call (stock Boltz 2.2.1 computes `ds % mps + 1` chunks, so ds=25 with the default 5 runs all 25 in one call). `0` restores stock chunking |
+| `BOLTZ_NEURON_AUTO_MPS` | `1` on trn2 at LNC=2 | at `--diffusion_samples` >= 16, run 5 samples per diffusion call for inputs of >= 288 tokens and all samples at once below (overrides `--max_parallel_samples`; see "Samples per diffusion call"). `BOLTZ_NEURON_AUTO_MPS_MIN_N` / `_VALUE` tune it; `0` uses `--max_parallel_samples` as given |
 | `BOLTZ_NEURON_TRI_ATTN` | `k24` on trn2 at LNC=2, else `stock` | `k24` = NKI triangle-attention core (see "NKI triangle attention"); `stock` = Boltz's PyTorch attention |
 | `BOLTZ_NEURON_K24_I_CHUNK` | `64` | pair rows per NKI kernel call |
 | `BOLTZ_NEURON_K24_BIAS` | `bf16` | `hilo` = carry the triangle bias at ~fp32 precision (two bf16 parts). Attention-core error 4.5x lower, module error ~3% lower, structures unchanged, ~7% slower |

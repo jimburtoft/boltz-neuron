@@ -17,7 +17,7 @@ omegaconf allowlist) and tolerates newer checkpoint kwargs.
 
 Optional, off by default:
   BOLTZ_TRIMUL_KCHUNK=<k>          split the triangle-multiplication contraction into k-sized chunks
-  BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1 treat --max_parallel_samples as a per-chunk cap
+  BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1 treat --max_parallel_samples as a per-chunk cap (default on trn2, see preamble)
   BOLTZ_TRANSITION_Z_CHUNK=<n>     override the pair-transition chunk size (0 disables)
 """
 
@@ -1115,11 +1115,12 @@ def apply_patches(
                 f"steering potentials compute_args -> fp32-safe feats "
                 f"({len(_pot_patched)} classes: {','.join(_pot_patched)})")
 
-    # --- max_parallel_samples as a cap (opt-in) ---
+    # --- max_parallel_samples as a cap ---
     # Boltz 2.2.1 computes sample_ids.chunk(multiplicity % max_parallel_samples + 1), i.e. a chunk
-    # COUNT from a modulus. With BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1 the count becomes
+    # COUNT from a modulus (ds=25, mps=5 -> ONE chunk of 25). With the fix the count becomes
     # ceil(multiplicity / max_parallel_samples), so the value caps samples per chunk. Bit-exact
-    # whenever ds <= max_parallel_samples.
+    # whenever ds <= max_parallel_samples. On by default on trn2 (preamble sets it, plus an
+    # N-dependent --max_parallel_samples); BOLTZ_FIX_MAX_PARALLEL_SAMPLES=0 restores stock chunking.
     if os.environ.get("BOLTZ_FIX_MAX_PARALLEL_SAMPLES", "") == "1":
         try:
             import math as _math
@@ -1127,10 +1128,30 @@ def apply_patches(
 
             _orig_chunk = torch.Tensor.chunk
 
+            # Auto samples-per-call (trn2 default, BOLTZ_NEURON_AUTO_MPS=1): measured DP=4 throughput,
+            # SDK 2.33 trn2.3xlarge LNC=2, 2026-11-11 (folding-neuron K-27). At ds >= 16 one call of all
+            # samples spills the [samples*heads, N, N] attention scores to HBM in 1 KB DMAs once N >= ~320;
+            # 5 per call is +23-28% at 352-544 tokens and +8% at 704. Below ~256 tokens the full batch is
+            # best (192 tokens: 5 per call is -10%). At ds <= 8 the choice is within ~5%, keep the user's.
+            _AUTO = os.environ.get("BOLTZ_NEURON_AUTO_MPS", "0") == "1"
+            _AUTO_MIN_N = int(os.environ.get("BOLTZ_NEURON_AUTO_MPS_MIN_N", "288"))
+            _AUTO_MPS = int(os.environ.get("BOLTZ_NEURON_AUTO_MPS_VALUE", "5"))
+            _logged = set()
+
             def _make_fixed_sample(orig_sample):
                 def _sample(self, *a, **kw):
                     mps = kw.get("max_parallel_samples", None)
                     mult = kw.get("multiplicity", None)
+                    if _AUTO and mult is not None and mult >= 16:
+                        st = kw.get("s_trunk", None)
+                        n_tok = st.shape[1] if st is not None and st.dim() >= 2 else None
+                        if n_tok is not None:
+                            want = _AUTO_MPS if n_tok >= _AUTO_MIN_N else mult
+                            if (n_tok, mult, want) not in _logged:
+                                _logged.add((n_tok, mult, want))
+                                print(f"[boltz-neuron] samples per diffusion call: {want} "
+                                      f"(N={n_tok}, diffusion_samples={mult}; BOLTZ_NEURON_AUTO_MPS)", flush=True)
+                            kw["max_parallel_samples"] = mps = want
                     if mps is None or mult is None:
                         return orig_sample(self, *a, **kw)
                     _want = max(1, _math.ceil(mult / mps))

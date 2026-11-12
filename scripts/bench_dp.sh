@@ -17,7 +17,7 @@ run(){  # core ncopies tag
   for i in $(seq 0 $((n-1))); do cp "$IN" "$d/in/${NAME}_$i.yaml"; done
   NEURON_RT_VISIBLE_CORES=$core python -m boltz_neuron predict "$d/in" --out_dir "$d/out" \
     --recycling_steps "${RECYCLING:-3}" --sampling_steps "${STEPS:-50}" --diffusion_samples "$DS" \
-    --num_workers 0 --override > "$d.log" 2>&1 || echo "core $core FAILED (see $d.log)"; }
+    --num_workers 0 --override ${EXTRA_ARGS:-} > "$d.log" 2>&1 || echo "core $core FAILED (see $d.log)"; }
 echo "[A] warm caches on core 0"; run 0 1 "${TAG}_warm"
 echo "[B] $W workers x $((REPS+1)) predictions"
 for c in $(seq 0 $((W-1))); do run "$c" $((REPS+1)) "$TAG" & done; wait

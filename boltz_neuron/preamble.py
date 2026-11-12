@@ -92,9 +92,15 @@ if INSTANCE.startswith("trn2"):
         # K-24 NKI triangle attention: validated on trn2 at LNC=2 (accuracy vs crystal unchanged, 1.4-2.1x more
         # structures/s at ds=1 for 384-682 tokens). Not tested on inf2 or at LNC=1. BOLTZ_NEURON_TRI_ATTN=stock disables.
         os.environ.setdefault("BOLTZ_NEURON_TRI_ATTN", "k24")
-        # With the split, 512 tokens x 25 samples no longer compiles at LNC=2 (NCC_ILSA902); it does with
-        # BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1. That setting is NOT made the default here: below ~448 tokens it is
-        # 5-40% slower (64 tokens x 8 samples 10.6 vs 7.2 s). README: set it for 448-576 tokens at ds >= 16.
+        # Samples per diffusion call (2026-11-11, folding-neuron K-27, DP=4 throughput): with all samples in
+        # one call the score model spills the [samples*heads, N, N] attention scores to HBM once N >= ~320.
+        # Default: max_parallel_samples is a real cap, and at ds >= 16 calls run 5 samples for N >= 288 tokens
+        # (+23-28% at 352-544 tokens, +8% at 704, and 448-704 tokens x 25 samples compile and fit) and all
+        # samples below (192 tokens: full batch is 10% faster). ds <= 8 keeps --max_parallel_samples.
+        # BOLTZ_FIX_MAX_PARALLEL_SAMPLES=0 / BOLTZ_NEURON_AUTO_MPS=0 restore stock Boltz chunking.
+        os.environ.setdefault("BOLTZ_FIX_MAX_PARALLEL_SAMPLES", "1")
+        if os.environ["BOLTZ_FIX_MAX_PARALLEL_SAMPLES"] == "1":
+            os.environ.setdefault("BOLTZ_NEURON_AUTO_MPS", "1")
 
 import torch
 import torch.nn.functional as F
