@@ -201,7 +201,11 @@ Structures per hour, one device, 4 workers, 2026-11-11:
 | 8ARE (544) | 25 | 4,526 | **5,414** | 4,830 |
 | 8CLZ (704) | 25 | out of memory | **3,818** | 3,528 |
 
-With the new defaults and no flags: 8EIL 22,727, 8C4D 10,616, 8CPK 10,280, 8CLZ 3,687 structures/hour. At 8
+With the new defaults and no flags: 8EIL 22,727, 8C4D 10,616, 8CPK 10,280, 8CLZ 3,687 structures/hour.
+With steering (`BOLTZ_NEURON_STEERING=nim`), 8CLZ at 25 samples also needed the steering potentials split: they
+hold every pair of the ~5,400 atoms for all 75 samples x particles at once (5.7 GB for one tensor). They now run
+in chunks of particles (same results, checked to 0.0000 A): 8CLZ steered x 25 samples runs at 1,640
+structures/hour (it ran out of memory before). At 8
 samples the choice is within ~5%, so `--max_parallel_samples` is used as given. The noise is drawn for all samples
 up front, so the samples are the same; the outputs differ from the one-call run only by bf16 rounding.
 
@@ -410,6 +414,7 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_WRITER_CPU` | `1` | remove padding from outputs on CPU |
 | `BOLTZ_NEURON_UID_WRAP` | `1` | keep residue ids exact in bf16 above 256 residues |
 | `BOLTZ_FIX_MAX_PARALLEL_SAMPLES` | `1` on trn2 at LNC=2, else unset | `--max_parallel_samples` is a cap on samples per diffusion call (stock Boltz 2.2.1 computes `ds % mps + 1` chunks, so ds=25 with the default 5 runs all 25 in one call). `0` restores stock chunking |
+| `BOLTZ_NEURON_POTENTIAL_CHUNK` / `_GB` | auto (1.5 GB) | steering potentials run over the particles in chunks so their per-pair tensors stay under the budget (exact; lets NIM-style steering run at 682 tokens x 25 samples on one core); `_CHUNK=<n>` fixes the chunk size |
 | `BOLTZ_NEURON_AUTO_MPS` | `1` on trn2 at LNC=2 | at `--diffusion_samples` >= 16, run 5 samples per diffusion call for inputs of >= 288 tokens and all samples at once below (overrides `--max_parallel_samples`; see "Samples per diffusion call"). `BOLTZ_NEURON_AUTO_MPS_MIN_N` / `_VALUE` tune it; `0` uses `--max_parallel_samples` as given |
 | `BOLTZ_NEURON_TRI_ATTN` | `k24` on trn2 at LNC=2, else `stock` | `k24` = NKI triangle-attention core (see "NKI triangle attention"); `stock` = Boltz's PyTorch attention |
 | `BOLTZ_NEURON_K24_I_CHUNK` | `64` | pair rows per NKI kernel call |

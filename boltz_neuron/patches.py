@@ -1107,6 +1107,9 @@ def apply_patches(
 
     if os.environ.get("BOLTZ_NEURON_STATIC_STEERING", "1") not in ("0", "false", "no") and _apply_flat_bottom_static_shape_patch():
         installed["patches"].append("FlatBottomPotential.compute_function -> torch.where (static shapes; bit-exact)")
+    _pc = _apply_potential_particle_chunk_patch()
+    if _pc:
+        installed["patches"].append(f"Potential.compute / compute_gradient -> chunked over particles ({_pc})")
 
     if steering_potentials_dtype_fix and dtype != torch.float32:
         _pot_patched = _apply_steering_potentials_dtype_patch()
@@ -1358,6 +1361,60 @@ def _apply_pair_pad_mask_gather_workaround():
     cls.compute_args = compute_args
     patched.append("VDWOverlapPotential.compute_args")
     return patched
+
+
+def _apply_potential_particle_chunk_patch():
+    """Run steering potentials over the particle/sample axis in chunks (exact).
+
+    With fk_steering the sampler holds diffusion_samples x num_particles coordinate sets (25 x 3 = 75) and every
+    potential computes per-pair tensors for all of them at once. For 8clz (N=682, ~5,400 atoms) VDWOverlapPotential
+    has 6.34M atom pairs, so r_ij is [75, 6.34M, 3] fp32 = 5.7 GB and value/energy [75, 6.34M] = 1.9 GB each -- more
+    than one 24 GB logical core holds next to the model (measured NRT_RESOURCE on 5,706,350,592 / 1,902,116,864-byte
+    allocations, 2026-11-12). compute() returns a per-particle energy and compute_gradient() a per-particle gradient,
+    each a function of that particle's coordinates only, so splitting the leading axis and concatenating is exact.
+    Chunk = BOLTZ_NEURON_POTENTIAL_CHUNK particles (default: enough to keep ~1.5 GB per pair tensor).
+    """
+    try:
+        import boltz.model.potentials.potentials as P
+    except Exception:
+        return ""
+    if getattr(P.Potential, "_bn_particle_chunk", False):
+        return "already"
+    _fixed = int(os.environ.get("BOLTZ_NEURON_POTENTIAL_CHUNK", "0"))
+    _budget = float(os.environ.get("BOLTZ_NEURON_POTENTIAL_CHUNK_GB", "1.5")) * 1e9
+
+    def _chunk_for(self, coords):
+        if coords.dim() < 3 or coords.shape[0] <= 1:
+            return 0
+        if _fixed > 0:
+            return _fixed if _fixed < coords.shape[0] else 0
+        # largest per-pair tensor per particle ~ n_pairs x 3 x 4 bytes; n_pairs <= atoms^2 / 2 (VDW all-pairs)
+        a = coords.shape[-2]
+        per = a * a / 2 * 12
+        c = max(1, int(_budget // per))
+        return c if c < coords.shape[0] else 0
+
+    _orig_compute = P.Potential.compute
+    _orig_grad = P.Potential.compute_gradient
+
+    def compute(self, coords, feats, parameters):
+        c = _chunk_for(self, coords)
+        if not c:
+            return _orig_compute(self, coords, feats, parameters)
+        return torch.cat([_orig_compute(self, coords[i:i + c], feats, parameters)
+                          for i in range(0, coords.shape[0], c)], 0)
+
+    def compute_gradient(self, coords, feats, parameters):
+        c = _chunk_for(self, coords)
+        if not c:
+            return _orig_grad(self, coords, feats, parameters)
+        return torch.cat([_orig_grad(self, coords[i:i + c], feats, parameters)
+                          for i in range(0, coords.shape[0], c)], 0)
+
+    P.Potential.compute = compute
+    P.Potential.compute_gradient = compute_gradient
+    P.Potential._bn_particle_chunk = True
+    return f"budget {_budget / 1e9:.1f} GB" if not _fixed else f"{_fixed} particles"
 
 
 def _apply_flat_bottom_static_shape_patch():
