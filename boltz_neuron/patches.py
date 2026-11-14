@@ -81,6 +81,54 @@ def _tri_mul_in_forward_clean(self, x: torch.Tensor, mask: torch.Tensor, use_ker
     return x
 
 
+# --- K-28: triangle multiplication as compiled prologue + bmm + compiled epilogue (default on trn2) ---
+# Op-by-op eager (shipped before) dispatches ~12 graphs per module; the whole module in one compiled graph is 20-100x
+# slower (the compiler lowers the [N,N,128] x [N,N,128] contraction badly). Splitting at the contraction gives two
+# small compiled graphs and one batched matmul over channels: 1.4x at 384 tokens, 1.5x at 704, 2.3-2.6x at 1,024
+# (trn2.3xlarge, SDK 2.33, real weights; rel vs fp32 0.0075-0.0083 vs 0.0078-0.0087 eager). Same math as stock.
+_TM_COMPILED = {}
+
+
+def _tm_prologue(x, mask, ln_w, ln_b, w_p, w_g):
+    import torch.nn.functional as F
+    xn = F.layer_norm(x, (x.shape[-1],), ln_w, ln_b, 1e-5)
+    y = F.linear(xn, w_p) * torch.sigmoid(F.linear(xn, w_g)) * mask.unsqueeze(-1)
+    D = y.shape[-1] // 2
+    ab = y.permute(0, 3, 1, 2)                                   # [B, 2D, N, N] channel-major
+    B = x.shape[0]
+    return xn, ab[:, :D].reshape(B * D, *ab.shape[2:]).contiguous(), ab[:, D:].reshape(B * D, *ab.shape[2:]).contiguous()
+
+
+def _tm_epilogue(o_cm, xn, ln_w, ln_b, w_po, w_go):
+    import torch.nn.functional as F
+    B = xn.shape[0]
+    o = o_cm.view(B, -1, *o_cm.shape[1:]).permute(0, 2, 3, 1)  # [B, N, N, D]
+    return F.linear(F.layer_norm(o, (o.shape[-1],), ln_w, ln_b, 1e-5), w_po) * torch.sigmoid(F.linear(xn, w_go))
+
+
+def _tm_split_forward(self, x, mask, outgoing):
+    if x.device.type != "neuron":
+        return (_tri_mul_out_forward_clean if outgoing else _tri_mul_in_forward_clean)(self, x, mask)
+    key = (tuple(x.shape), x.dtype)
+    fns = _TM_COMPILED.get(key)
+    if fns is None:
+        fns = _TM_COMPILED[key] = (torch.compile(_tm_prologue, backend="neuron", fullgraph=True, dynamic=False),
+                                   torch.compile(_tm_epilogue, backend="neuron", fullgraph=True, dynamic=False))
+    cp, ce = fns
+    xn, a, b = cp(x, mask.to(x.dtype), self.norm_in.weight, self.norm_in.bias, self.p_in.weight, self.g_in.weight)
+    # outgoing: o[d,i,j] = sum_k a[d,i,k] b[d,j,k];  incoming: o[d,i,j] = sum_k a[d,k,i] b[d,k,j]
+    o = torch.bmm(a, b.transpose(1, 2)) if outgoing else torch.bmm(a.transpose(1, 2), b)
+    return ce(o, xn, self.norm_out.weight, self.norm_out.bias, self.p_out.weight, self.g_out.weight)
+
+
+def _tri_mul_out_forward_split(self, x, mask, use_kernels=False):
+    return _tm_split_forward(self, x, mask, True)
+
+
+def _tri_mul_in_forward_split(self, x, mask, use_kernels=False):
+    return _tm_split_forward(self, x, mask, False)
+
+
 def _tri_mul_kchunked_einsum(a, b, direction, k_chunk):
     """Accumulate the tri_mul einsum over the contraction axis k in chunks.
 
@@ -1007,6 +1055,10 @@ def apply_patches(
         installed["patches"].append(
             f"TriangleMultiplication{{Out,In}}going.forward -> K-CHUNKED contraction "
             f"(k_chunk={os.environ.get('BOLTZ_TRIMUL_KCHUNK')})")
+    elif os.environ.get("BOLTZ_NEURON_TRIMUL", "eager").lower() == "split" and dtype == torch.bfloat16:
+        TriangleMultiplicationOutgoing.forward = _tri_mul_out_forward_split
+        TriangleMultiplicationIncoming.forward = _tri_mul_in_forward_split
+        installed["patches"].append("TriangleMultiplication{Out,In}going.forward -> compiled prologue + bmm + compiled epilogue (BOLTZ_NEURON_TRIMUL=split)")
     else:
         TriangleMultiplicationOutgoing.forward = _tri_mul_out_forward_clean
         installed["patches"].append("TriangleMultiplicationOutgoing.forward -> clean (no .float() cast)")

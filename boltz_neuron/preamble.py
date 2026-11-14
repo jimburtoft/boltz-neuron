@@ -92,6 +92,9 @@ if INSTANCE.startswith("trn2"):
         # K-24 NKI triangle attention: validated on trn2 at LNC=2 (accuracy vs crystal unchanged, 1.4-2.1x more
         # structures/s at ds=1 for 384-682 tokens). Not tested on inf2 or at LNC=1. BOLTZ_NEURON_TRI_ATTN=stock disables.
         os.environ.setdefault("BOLTZ_NEURON_TRI_ATTN", "k24")
+        # K-28 triangle multiplication: compiled prologue + channel-major bmm + compiled epilogue (1.4-1.6x per
+        # module at 384-704 tokens vs op-by-op eager, closer to fp32). BOLTZ_NEURON_TRIMUL=eager disables.
+        os.environ.setdefault("BOLTZ_NEURON_TRIMUL", "split")
         # Samples per diffusion call (2026-11-11, folding-neuron K-27, DP=4 throughput): with all samples in
         # one call the score model spills the [samples*heads, N, N] attention scores to HBM once N >= ~320.
         # Default: max_parallel_samples is a real cap, and at ds >= 16 calls run 5 samples for N >= 288 tokens
@@ -521,4 +524,4 @@ def apply():
     global _FAST_INIT_STATE
     _FAST_INIT_STATE = _install_fast_init()
     _install_load_hook()
-    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'nim' if STEERING_NIM else ('on' if STEERING else 'off')} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')} tri_attn={os.environ.get('BOLTZ_NEURON_TRI_ATTN', 'stock')}")
+    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'nim' if STEERING_NIM else ('on' if STEERING else 'off')} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')} tri_attn={os.environ.get('BOLTZ_NEURON_TRI_ATTN', 'stock')} trimul={os.environ.get('BOLTZ_NEURON_TRIMUL', 'eager')}")

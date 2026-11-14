@@ -127,6 +127,58 @@ def _forward_fn(x, mask, ln_w, ln_b, w_tri, w_q, w_k, w_v, w_g, w_o, starting: b
     return out
 
 
+def _forward_fn_v2(x, mask, ln_w, ln_b, w_tri, w_q, w_k, w_v, w_g, w_o, starting: bool, inf: float, H: int, D: int):
+    """K-28 layout variant: project q/k/v/g straight into the kernel's chunked head-major layout
+    [nchunk, H, ic, J, D] (one einsum each), so every kernel input is a contiguous view (no per-chunk transpose +
+    copy), multiply the gate in that layout, and contract (h, d) in the output projection directly (no permute back).
+    Numerically the same ops as _forward_fn."""
+    if not starting:
+        x = x.transpose(-2, -3)
+        mask = mask.transpose(-1, -2)
+    x = torch.nn.functional.layer_norm(x, (x.shape[-1],), ln_w.to(x.dtype), ln_b.to(x.dtype), 1e-5)
+    x0 = x[0]
+    I, J, C = x0.shape
+    ic = I_CHUNK if I % I_CHUNK == 0 else (32 if I % 32 == 0 else I)
+    nc = I // ic
+    xc = x0.view(nc, ic, J, C)
+    tri = torch.nn.functional.linear(x0, w_tri).permute(2, 0, 1)
+    m = mask[0]
+    real_rows = m.amax(1) > 0
+    bias = tri.float() + (inf * (m.amax(0).float() - 1.0))[None, None, :]
+    q = torch.einsum("cijk,hdk->chijd", xc, w_q.view(H, D, C))           # [nc, H, ic, J, D]
+    v = torch.einsum("cijk,hdk->chijd", xc, w_v.view(H, D, C))
+    k = torch.einsum("cijk,hdk->chidj", xc, w_k.view(H, D, C))           # [nc, H, ic, D, J]
+    g = torch.sigmoid(torch.einsum("cijk,hdk->chijd", xc, w_g.view(H, D, C)))
+    scale = 1.0 / math.sqrt(D)
+    cte = _kernel()[LNC]
+    kw = _kernel_opts(J)
+    pb = (bias / scale).to(torch.float32).contiguous()
+    outs = []
+    for c in range(nc):
+        o = cte(q[c].reshape(H * ic, J, D), k[c].reshape(H * ic, D, J), v[c].reshape(H * ic, J, D), scale=scale,
+                causal_mask=False, tp_q=True, tp_k=False, position_bias=pb, bias_heads=H, **kw)
+        outs.append(o.view(1, H, ic, J, D))
+    o = torch.cat(outs, 0) if nc > 1 else outs[0]                         # [nc, H, ic, J, D]
+    rr = real_rows.view(nc, 1, ic, 1, 1)
+    o = torch.where(rr, o, v.float().mean(dim=3, keepdim=True).to(o.dtype).expand_as(o))
+    o = o.to(g.dtype) * g
+    out = torch.einsum("chijd,ohd->cijo", o, w_o.view(-1, H, D)).reshape(1, I, J, -1)
+    if not starting:
+        out = out.transpose(-2, -3)
+    return out
+
+
+# K-28: v2 (project straight into the kernel's chunked layout, no per-chunk copies) vs v1, measured per module
+# (layer 0/31, trn2 LNC=2): end node v2 1.02-1.13x faster at 384-1,024; start node v2 slower at 384 (13.0 vs 9.0 ms),
+# same at 544-704, 1.01x at 1,024. "auto" = v2 for the end node at any N and for the start node at N >= 1,024.
+LAYOUT = os.environ.get("BOLTZ_NEURON_K24_LAYOUT", "auto")
+
+
+def _layout_for(starting, J):
+    if LAYOUT in ("v1", "v2"):
+        return LAYOUT
+    return "v2" if (not starting or J >= 1024) else "v1"
+
 _outer_cache = {}
 
 
@@ -168,7 +220,8 @@ def forward(self, x, mask=None, chunk_size=None, use_kernels=False):
     key = (bool(self.starting), tuple(x.shape), x.dtype)
     fn = _compiled.get(key)
     if fn is None:
-        fn = torch.compile(_forward_fn, backend="neuron", fullgraph=True, dynamic=False)
+        fn = torch.compile(_forward_fn_v2 if _layout_for(bool(self.starting), x.shape[1]) == "v2" else _forward_fn,
+                           backend="neuron", fullgraph=True, dynamic=False)
         _compiled[key] = fn
         print(f"[boltz-neuron] K-24 tri-attn: compiling graph starting={key[0]} shape={key[1]}", flush=True)
     mha = self.mha

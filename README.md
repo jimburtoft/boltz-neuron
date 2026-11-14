@@ -209,6 +209,17 @@ structures/hour (it ran out of memory before). At 8
 samples the choice is within ~5%, so `--max_parallel_samples` is used as given. The noise is drawn for all samples
 up front, so the samples are the same; the outputs differ from the one-call run only by bf16 rounding.
 
+### Triangle multiplication (default on trn2 at LNC=2, 2026-11-14)
+
+Triangle multiplication is about a quarter of the trunk. Compiled as one graph it is 20-100x slower than op by
+op; split at the contraction (compiled LayerNorm + projections + gate, one batched matmul over the 128 channels,
+compiled output norm + projection + gate) it is 1.4-1.6x faster than op by op per module (384 tokens 3.7 vs 5.3 ms,
+704 tokens 10.9 vs 15-17 ms, 1,024 tokens 20 vs 45-53 ms), with slightly lower error vs fp32. With it (and the
+triangle-attention layout change), structures per hour on one device (4 workers, no MSA), vs the K-25 kernel:
+8CPK ds=1 1,373 (1,223), 8ARE ds=1 636 (573), 8CLZ ds=1 436 (399) / ds=8 2,353 (2,110) / ds=25 4,028 (3,871),
+8EIL ds=25 24,357 (23,166), 8CPK ds=25 11,177 (10,280). Crystal-structure accuracy is unchanged (3W7T 0.89 / 0.90 A,
+5A7M 0.61 / 0.60 A, 6EA2 0.49 / 0.46 A).
+
 The same kernel is published as a standalone Hugging Face Kernel Hub package,
 [`jburtoft/triangle-attention-neuron-kernels`](https://huggingface.co/kernels/jburtoft/triangle-attention-neuron-kernels)
 (`get_kernel(..., version=1)`, `patch_boltz()`), for use outside this package.
@@ -413,6 +424,8 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_DROP_DISTO` | `1` | drop a training-only feature before it reaches the device |
 | `BOLTZ_NEURON_WRITER_CPU` | `1` | remove padding from outputs on CPU |
 | `BOLTZ_NEURON_UID_WRAP` | `1` | keep residue ids exact in bf16 above 256 residues |
+| `BOLTZ_NEURON_TRIMUL` | `split` on trn2 at LNC=2, else `eager` | triangle multiplication as a compiled prologue (LayerNorm, projections, gate) + one channel-major batched matmul + a compiled epilogue (1.4-1.6x per module at 384-704 tokens, 2.3x at 1,024; slightly closer to fp32). `eager` = op by op |
+| `BOLTZ_NEURON_K24_LAYOUT` | `auto` | `v2` projects q/k/v/g straight into the kernel's layout (no per-chunk copies; faster for the end node); `auto` uses it for the end node and for the start node from 1,024 tokens |
 | `BOLTZ_FIX_MAX_PARALLEL_SAMPLES` | `1` on trn2 at LNC=2, else unset | `--max_parallel_samples` is a cap on samples per diffusion call (stock Boltz 2.2.1 computes `ds % mps + 1` chunks, so ds=25 with the default 5 runs all 25 in one call). `0` restores stock chunking |
 | `BOLTZ_NEURON_POTENTIAL_CHUNK` / `_GB` | auto (1.5 GB) | steering potentials run over the particles in chunks so their per-pair tensors stay under the budget (exact; lets NIM-style steering run at 682 tokens x 25 samples on one core); `_CHUNK=<n>` fixes the chunk size |
 | `BOLTZ_NEURON_AUTO_MPS` | `1` on trn2 at LNC=2 | at `--diffusion_samples` >= 16, run 5 samples per diffusion call for inputs of >= 288 tokens and all samples at once below (overrides `--max_parallel_samples`; see "Samples per diffusion call"). `BOLTZ_NEURON_AUTO_MPS_MIN_N` / `_VALUE` tune it; `0` uses `--max_parallel_samples` as given |
