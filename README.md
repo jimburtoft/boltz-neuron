@@ -220,7 +220,8 @@ triangle-attention layout change), structures per hour on one device (4 workers,
 8EIL ds=25 24,357 (23,166), 8CPK ds=25 11,177 (10,280). Crystal-structure accuracy is unchanged (3W7T 0.89 / 0.90 A,
 5A7M 0.61 / 0.60 A, 6EA2 0.49 / 0.46 A).
 
-The same kernel is published as a standalone Hugging Face Kernel Hub package,
+The same kernel, and since 1.1.0 the split triangle multiplication, is published as a standalone Hugging Face
+Kernel Hub package,
 [`jburtoft/triangle-attention-neuron-kernels`](https://huggingface.co/kernels/jburtoft/triangle-attention-neuron-kernels)
 (`get_kernel(..., version=1)`, `patch_boltz()`), for use outside this package.
 
