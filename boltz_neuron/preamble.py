@@ -104,6 +104,13 @@ if INSTANCE.startswith("trn2"):
         os.environ.setdefault("BOLTZ_FIX_MAX_PARALLEL_SAMPLES", "1")
         if os.environ["BOLTZ_FIX_MAX_PARALLEL_SAMPLES"] == "1":
             os.environ.setdefault("BOLTZ_NEURON_AUTO_MPS", "1")
+    elif os.environ.get("BOLTZ_NEURON_LNC1_KERNELS", "0") == "1":
+        # K-29 experiment: the same kernels / defaults at LNC=1 (not validated as a default)
+        os.environ.setdefault("BOLTZ_NEURON_TRI_ATTN", "k24")
+        os.environ.setdefault("BOLTZ_NEURON_TRIMUL", "split")
+        os.environ.setdefault("BOLTZ_FIX_MAX_PARALLEL_SAMPLES", "1")
+        if os.environ["BOLTZ_FIX_MAX_PARALLEL_SAMPLES"] == "1":
+            os.environ.setdefault("BOLTZ_NEURON_AUTO_MPS", "1")
 
 import torch
 import torch.nn.functional as F

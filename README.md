@@ -209,6 +209,15 @@ structures/hour (it ran out of memory before). At 8
 samples the choice is within ~5%, so `--max_parallel_samples` is used as given. The noise is drawn for all samples
 up front, so the samples are the same; the outputs differ from the one-call run only by bf16 rounding.
 
+### LNC=1: more throughput for small inputs, much smaller size limit (2026-11-16)
+
+`NEURON_LOGICAL_NC_CONFIG=1 BOLTZ_NEURON_LNC1_KERNELS=1` runs 8 workers of 12 GB per device instead of 4 of 24 GB.
+Structures per hour, one device, no MSA (LNC=2 -> LNC=1): 8EIL (192 tokens) ds=1 2,712 -> 3,466 (+28%), 8CPK (384)
+ds=1 1,375 -> 1,566 (+14%), ds=25 11,177 -> 12,999 (+16%), 8ARE (544) ds=1 +11%, 8CLZ (704) ds=1 +4%; 8CLZ x 25
+samples does not fit. **The size limit with all 8 workers busy falls to 736 / 736 / 544 tokens at 1 / 8 / 25 samples
+(LNC=2: 1,408 / 1,152 / 1,024), and MSA inputs fail earlier (760 tokens with an MSA did not fit).** Accuracy is the
+same (5A7M 0.61 A). Use it only for screening many small inputs; LNC=2 stays the default.
+
 ### Triangle multiplication (default on trn2 at LNC=2, 2026-11-14)
 
 Triangle multiplication is about a quarter of the trunk. Compiled as one graph it is 20-100x slower than op by
@@ -427,6 +436,7 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_UID_WRAP` | `1` | keep residue ids exact in bf16 above 256 residues |
 | `BOLTZ_NEURON_TRIMUL` | `split` on trn2 at LNC=2, else `eager` | triangle multiplication as a compiled prologue (LayerNorm, projections, gate) + one channel-major batched matmul + a compiled epilogue (1.4-1.6x per module at 384-704 tokens, 2.3x at 1,024; slightly closer to fp32). `eager` = op by op |
 | `BOLTZ_NEURON_K24_LAYOUT` | `auto` | `v2` projects q/k/v/g straight into the kernel's layout (no per-chunk copies; faster for the end node); `auto` uses it for the end node and for the start node from 1,024 tokens |
+| `BOLTZ_NEURON_LNC1_KERNELS` | unset | with `NEURON_LOGICAL_NC_CONFIG=1`, also use the NKI triangle attention, split triangle multiplication and samples-per-call cap (otherwise LNC=1 runs the stock paths). See "LNC=1" below: more throughput for small inputs, much lower size limits |
 | `BOLTZ_FIX_MAX_PARALLEL_SAMPLES` | `1` on trn2 at LNC=2, else unset | `--max_parallel_samples` is a cap on samples per diffusion call (stock Boltz 2.2.1 computes `ds % mps + 1` chunks, so ds=25 with the default 5 runs all 25 in one call). `0` restores stock chunking |
 | `BOLTZ_NEURON_POTENTIAL_CHUNK` / `_GB` | auto (1.5 GB) | steering potentials run over the particles in chunks so their per-pair tensors stay under the budget (exact; lets NIM-style steering run at 682 tokens x 25 samples on one core); `_CHUNK=<n>` fixes the chunk size |
 | `BOLTZ_NEURON_AUTO_MPS` | `1` on trn2 at LNC=2 | at `--diffusion_samples` >= 16, run 5 samples per diffusion call for inputs of >= 288 tokens and all samples at once below (overrides `--max_parallel_samples`; see "Samples per diffusion call"). `BOLTZ_NEURON_AUTO_MPS_MIN_N` / `_VALUE` tune it; `0` uses `--max_parallel_samples` as given |
