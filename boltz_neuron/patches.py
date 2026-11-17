@@ -1159,6 +1159,10 @@ def apply_patches(
 
     if os.environ.get("BOLTZ_NEURON_STATIC_STEERING", "1") not in ("0", "false", "no") and _apply_flat_bottom_static_shape_patch():
         installed["patches"].append("FlatBottomPotential.compute_function -> torch.where (static shapes; bit-exact)")
+    if os.environ.get("BOLTZ_NEURON_FAST_SAMPLER", "0") == "1":
+        _fs = _apply_fast_sampler_helpers_patch()
+        if _fs:
+            installed["patches"].append(f"diffusion sampler helpers -> {_fs} (BOLTZ_NEURON_FAST_SAMPLER=1)")
     _pc = _apply_potential_particle_chunk_patch()
     if _pc:
         installed["patches"].append(f"Potential.compute / compute_gradient -> chunked over particles ({_pc})")
@@ -1413,6 +1417,88 @@ def _apply_pair_pad_mask_gather_workaround():
     cls.compute_args = compute_args
     patched.append("VDWOverlapPotential.compute_args")
     return patched
+
+
+def _apply_fast_sampler_helpers_patch():
+    """K-30: the diffusion sampler's per-step helpers as few device graphs (default on trn2).
+
+    Each of the 50 sampling steps runs compute_random_augmentation (a random rotation from a random quaternion:
+    ~20 tiny eager ops, 3.0-6.7 ms) and weighted_rigid_align (centroids, 3x3 covariance, SVD, det, ~30 tiny
+    eager ops, 5.5-8.2 ms). As eager ops each is a separate device launch; at LNC=2 every launch also syncs the two
+    physical cores, so these steps cost ~16 ms at LNC=2 vs ~10 ms at LNC=1 (measured), ~0.8 s of a 5 s
+    prediction at 192 tokens. Here: weighted_rigid_align is one compiled graph for the reductions/covariance, the
+    3x3 SVD + det on the CPU (9 numbers), and one compiled graph to apply the rotation -- same math, fp32 (5A7M /
+    3W7T within 0.11 A of stock, same seed). Measured DP=4 at LNC=2: 8EIL ds=1 +3.5%, 8CPK +2.1%. Optionally
+    (BOLTZ_NEURON_FAST_SAMPLER_AUG=1) the per-step random rotation is drawn on the CPU (+7% at 8EIL, but a
+    different random stream). Opt-in (K-30)."""
+    try:
+        import boltz.model.modules.utils as U
+        import boltz.model.loss.diffusionv2 as L
+        import boltz.model.modules.diffusionv2 as D
+    except Exception:
+        return ""
+    if getattr(L, "_bn_fast_align", False):
+        return "already"
+
+    def _cov(true_coords, pred_coords, weights, mask):
+        w = (mask * weights).unsqueeze(-1)
+        tc = (true_coords * w).sum(dim=-2, keepdim=True) / w.sum(dim=-2, keepdim=True)
+        pc = (pred_coords * w).sum(dim=-2, keepdim=True) / w.sum(dim=-2, keepdim=True)
+        t0 = true_coords - tc
+        p0 = pred_coords - pc
+        cov = torch.einsum("bni,bnj->bij", w * p0, t0)
+        return t0, pc, cov
+
+    def _apply(t0, pc, rot):
+        return torch.einsum("bni,bji->bnj", t0, rot) + pc
+
+    _c = {}
+
+    def _get(name, fn):
+        f = _c.get(name)
+        if f is None:
+            f = _c[name] = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
+        return f
+
+    _orig_align = L.weighted_rigid_align
+
+    def weighted_rigid_align(true_coords, pred_coords, weights, mask):
+        if true_coords.device.type != "neuron" or true_coords.dim() != 3:
+            return _orig_align(true_coords, pred_coords, weights, mask)
+        dt = true_coords.dtype
+        f32 = torch.float32   # .to(): boltz-neuron's bf16 bypass makes .float() a no-op on bf16 tensors
+        t0, pc, cov = _get("cov", _cov)(true_coords.to(f32), pred_coords.to(f32), weights.to(f32), mask.to(f32))
+        c = cov.cpu().to(f32)
+        Uu, S, V = torch.linalg.svd(c)
+        V = V.mH
+        rot = torch.einsum("bij,bkj->bik", Uu, V)
+        Fm = torch.eye(3, dtype=c.dtype)[None].repeat(c.shape[0], 1, 1)
+        Fm[:, -1, -1] = torch.det(rot)
+        rot = torch.einsum("bij,bjk,blk->bil", Uu, Fm, V)
+        out = _get("apply", _apply)(t0, pc, rot.to(t0.device))
+        return out.to(dt)
+
+    L.weighted_rigid_align = weighted_rigid_align
+    if hasattr(D, "weighted_rigid_align"):
+        D.weighted_rigid_align = weighted_rigid_align
+
+    _orig_aug = U.compute_random_augmentation
+
+    def compute_random_augmentation(multiplicity, s_trans=1.0, device=None, dtype=torch.float32):
+        if device is None or torch.device(device).type != "neuron":
+            return _orig_aug(multiplicity, s_trans=s_trans, device=device, dtype=dtype)
+        # draw on the CPU with the stock functions (same distribution), move the tiny result to the device once
+        R, tr = _orig_aug(multiplicity, s_trans=s_trans, device="cpu", dtype=dtype)
+        return R.to(device), tr.to(device)
+
+    # Off by default: drawing the random rotations on the CPU changes the random stream (a different, equally valid
+    # sample; 5A7M seed 0/1 0.65/0.74 A vs 0.61/0.60 A stock), so it is not a like-for-like change.
+    if os.environ.get("BOLTZ_NEURON_FAST_SAMPLER_AUG", "0") == "1":
+        U.compute_random_augmentation = compute_random_augmentation
+        if hasattr(D, "compute_random_augmentation"):
+            D.compute_random_augmentation = compute_random_augmentation
+    L._bn_fast_align = True
+    return "rigid-align: compiled reductions + CPU 3x3 SVD" + ("; random augmentation on CPU" if os.environ.get("BOLTZ_NEURON_FAST_SAMPLER_AUG", "0") == "1" else "")
 
 
 def _apply_potential_particle_chunk_patch():
