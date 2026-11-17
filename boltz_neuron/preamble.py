@@ -95,6 +95,8 @@ if INSTANCE.startswith("trn2"):
         # K-28 triangle multiplication: compiled prologue + channel-major bmm + compiled epilogue (1.4-1.6x per
         # module at 384-704 tokens vs op-by-op eager, closer to fp32). BOLTZ_NEURON_TRIMUL=eager disables.
         os.environ.setdefault("BOLTZ_NEURON_TRIMUL", "split")
+        # K-31: fewer, larger graphs per Pairformer layer (layer tail + trimul pair fused). +5-18% structures/h.
+        os.environ.setdefault("BOLTZ_NEURON_LAYER_FUSE", "pair")
         # Samples per diffusion call (2026-11-11, folding-neuron K-27, DP=4 throughput): with all samples in
         # one call the score model spills the [samples*heads, N, N] attention scores to HBM once N >= ~320.
         # Default: max_parallel_samples is a real cap, and at ds >= 16 calls run 5 samples for N >= 288 tokens
@@ -108,6 +110,7 @@ if INSTANCE.startswith("trn2"):
         # K-29 experiment: the same kernels / defaults at LNC=1 (not validated as a default)
         os.environ.setdefault("BOLTZ_NEURON_TRI_ATTN", "k24")
         os.environ.setdefault("BOLTZ_NEURON_TRIMUL", "split")
+        os.environ.setdefault("BOLTZ_NEURON_LAYER_FUSE", "pair")
         os.environ.setdefault("BOLTZ_FIX_MAX_PARALLEL_SAMPLES", "1")
         if os.environ["BOLTZ_FIX_MAX_PARALLEL_SAMPLES"] == "1":
             os.environ.setdefault("BOLTZ_NEURON_AUTO_MPS", "1")
@@ -531,4 +534,4 @@ def apply():
     global _FAST_INIT_STATE
     _FAST_INIT_STATE = _install_fast_init()
     _install_load_hook()
-    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'nim' if STEERING_NIM else ('on' if STEERING else 'off')} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')} tri_attn={os.environ.get('BOLTZ_NEURON_TRI_ATTN', 'stock')} trimul={os.environ.get('BOLTZ_NEURON_TRIMUL', 'eager')}")
+    _log(f"ready: pad={PAD}(max_add={PAD_MAX_ADD}) compile_structure={COMPILE_STRUCTURE} steering={'nim' if STEERING_NIM else ('on' if STEERING else 'off')} drop_disto={DROP_DISTO} bad_shapes={BAD_SHAPES or 'off'} target={TARGET or '(unset)'} instance={INSTANCE or '?'} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')} atom_graph_break={os.environ.get('BOLTZ_NEURON_ATOM_GRAPH_BREAK', '0')} tri_attn={os.environ.get('BOLTZ_NEURON_TRI_ATTN', 'stock')} trimul={os.environ.get('BOLTZ_NEURON_TRIMUL', 'eager')} layer_fuse={os.environ.get('BOLTZ_NEURON_LAYER_FUSE', '0')}")

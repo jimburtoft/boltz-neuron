@@ -106,19 +106,50 @@ def _tm_epilogue(o_cm, xn, ln_w, ln_b, w_po, w_go):
     return F.linear(F.layer_norm(o, (o.shape[-1],), ln_w, ln_b, 1e-5), w_po) * torch.sigmoid(F.linear(xn, w_go))
 
 
-def _tm_split_forward(self, x, mask, outgoing):
+def _tm_epilogue_res(o_cm, xn, ln_w, ln_b, w_po, w_go, res):
+    return res + _tm_epilogue(o_cm, xn, ln_w, ln_b, w_po, w_go)
+
+
+def _tm_mid(o_cm, xn, ln_w, ln_b, w_po, w_go, res, mask, ln_w2, ln_b2, w_p2, w_g2):
+    """trimul_out epilogue + residual + trimul_in prologue in ONE graph (K-31 'pair' fusion)."""
+    z = res + _tm_epilogue(o_cm, xn, ln_w, ln_b, w_po, w_go)
+    xn2, a2, b2 = _tm_prologue(z, mask, ln_w2, ln_b2, w_p2, w_g2)
+    return z, xn2, a2, b2
+
+
+def _tm_pair_forward(lay, z, mask):
+    """tri_mul_out then tri_mul_in (both with residual) as 3 graphs + 2 bmm (was 4 graphs + 2 bmm + 2 adds)."""
+    to, ti = lay.tri_mul_out, lay.tri_mul_in
+    key = ("pair", tuple(z.shape), z.dtype)
+    fns = _TM_COMPILED.get(key)
+    if fns is None:
+        c = lambda f: torch.compile(f, backend="neuron", fullgraph=True, dynamic=False)
+        fns = _TM_COMPILED[key] = (c(_tm_prologue), c(_tm_mid), c(_tm_epilogue_res))
+    cp, cm, ce = fns
+    m = mask.to(z.dtype)
+    xn, a, b = cp(z, m, to.norm_in.weight, to.norm_in.bias, to.p_in.weight, to.g_in.weight)
+    o = torch.bmm(a, b.transpose(1, 2))
+    z, xn2, a2, b2 = cm(o, xn, to.norm_out.weight, to.norm_out.bias, to.p_out.weight, to.g_out.weight, z, m,
+                        ti.norm_in.weight, ti.norm_in.bias, ti.p_in.weight, ti.g_in.weight)
+    o2 = torch.bmm(a2.transpose(1, 2), b2)
+    return ce(o2, xn2, ti.norm_out.weight, ti.norm_out.bias, ti.p_out.weight, ti.g_out.weight, z)
+
+
+def _tm_split_forward(self, x, mask, outgoing, residual=False):
     if x.device.type != "neuron":
         return (_tri_mul_out_forward_clean if outgoing else _tri_mul_in_forward_clean)(self, x, mask)
-    key = (tuple(x.shape), x.dtype)
+    key = (tuple(x.shape), x.dtype, bool(residual))
     fns = _TM_COMPILED.get(key)
     if fns is None:
         fns = _TM_COMPILED[key] = (torch.compile(_tm_prologue, backend="neuron", fullgraph=True, dynamic=False),
-                                   torch.compile(_tm_epilogue, backend="neuron", fullgraph=True, dynamic=False))
+                                   torch.compile(_tm_epilogue_res if residual else _tm_epilogue, backend="neuron",
+                                                 fullgraph=True, dynamic=False))
     cp, ce = fns
     xn, a, b = cp(x, mask.to(x.dtype), self.norm_in.weight, self.norm_in.bias, self.p_in.weight, self.g_in.weight)
     # outgoing: o[d,i,j] = sum_k a[d,i,k] b[d,j,k];  incoming: o[d,i,j] = sum_k a[d,k,i] b[d,k,j]
     o = torch.bmm(a, b.transpose(1, 2)) if outgoing else torch.bmm(a.transpose(1, 2), b)
-    return ce(o, xn, self.norm_out.weight, self.norm_out.bias, self.p_out.weight, self.g_out.weight)
+    W = (self.norm_out.weight, self.norm_out.bias, self.p_out.weight, self.g_out.weight)
+    return ce(o, xn, *W, x) if residual else ce(o, xn, *W)
 
 
 def _tri_mul_out_forward_split(self, x, mask, use_kernels=False):
@@ -311,6 +342,64 @@ def _pairformer_layer_forward_clean(self, s, z, mask=None, pair_mask=None,
     s = self.s_post_norm(s)
 
     return s, z
+
+
+# --- K-31: larger graphs per Pairformer layer (BOLTZ_NEURON_LAYER_FUSE=pair, default on trn2) ---
+# At LNC=2 small graphs scale well below 2x and every launch costs a cross-core sync (K-30). "tail": the pair
+# transition + residual and the whole sequence stack (pre-norm, single-track attention, transition, post-norm) --
+# ~8 small modules -- become ONE compiled graph; the residual adds after triangle attention / multiplication move
+# into those graphs. "pair" additionally fuses trimul_out's epilogue, its residual and trimul_in's prologue into one
+# graph. Per layer (trn2.3xlarge LNC=2): 192 tokens 11.4 -> 8.8 ms, 384 29.8 -> 26.7, 704 103.9 -> 99.2; DP=4
+# structures/h +5-18%; same values (layer rel vs fp32 0.0714 vs 0.0716 shipped; crystal RMSD unchanged).
+_LAYER_FUSE = os.environ.get("BOLTZ_NEURON_LAYER_FUSE", "0")   # preamble sets "pair" on trn2 at LNC=2
+_TAIL_COMPILED = {}
+
+
+def _layer_tail(self, s, z, mask):
+    z = z + self.transition_z(z, None)
+    s_normed = self.pre_norm_s(s)
+    s = s + self.attention(s=s_normed, z=z, mask=mask, k_in=s_normed)
+    s = s + self.transition_s(s)
+    s = self.s_post_norm(s)
+    return s, z
+
+
+def _pairformer_layer_forward_fused(self, s, z, mask=None, pair_mask=None,
+                                    chunk_size_tri_attn=None, use_kernels=False,
+                                    use_cuequiv_mul=False, use_cuequiv_attn=False):
+    """PairformerLayer.forward with the layer tail as one compiled graph (BOLTZ_NEURON_LAYER_FUSE=tail)."""
+    if z.device.type != "neuron" or getattr(self, "_m01_transition_z_chunk", None) is not None:
+        return _pairformer_layer_forward_clean(self, s, z, mask, pair_mask, chunk_size_tri_attn, use_kernels,
+                                               use_cuequiv_mul, use_cuequiv_attn)
+    tm_split = type(self.tri_mul_out).forward is _tri_mul_out_forward_split
+    if tm_split and z.dtype == torch.bfloat16 and _LAYER_FUSE == "pair":
+        z = _tm_pair_forward(self, z, pair_mask)
+    elif tm_split and z.dtype == torch.bfloat16:
+        z = _tm_split_forward(self.tri_mul_out, z, pair_mask, True, residual=True)
+        z = _tm_split_forward(self.tri_mul_in, z, pair_mask, False, residual=True)
+    else:
+        z = z + self.tri_mul_out(z, mask=pair_mask, use_kernels=use_cuequiv_mul or use_kernels)
+        z = z + self.tri_mul_in(z, mask=pair_mask, use_kernels=use_cuequiv_mul or use_kernels)
+    k24 = None
+    try:
+        from boltz_neuron import k24_tri_attn as _K
+        if getattr(type(self.tri_att_start), "forward", None) is _K.forward:
+            k24 = _K
+    except Exception:
+        pass
+    if k24 is not None:
+        z = k24.forward(self.tri_att_start, z, mask=pair_mask, residual=True)
+        z = k24.forward(self.tri_att_end, z, mask=pair_mask, residual=True)
+    else:
+        z = z + self.tri_att_start(z, mask=pair_mask, chunk_size=chunk_size_tri_attn,
+                                    use_kernels=use_cuequiv_attn or use_kernels)
+        z = z + self.tri_att_end(z, mask=pair_mask, chunk_size=chunk_size_tri_attn,
+                                  use_kernels=use_cuequiv_attn or use_kernels)
+    key = (tuple(z.shape), tuple(s.shape), z.dtype, type(self.attention).__name__)
+    fn = _TAIL_COMPILED.get(key)
+    if fn is None:
+        fn = _TAIL_COMPILED[key] = torch.compile(_layer_tail, backend="neuron", fullgraph=True, dynamic=False)
+    return fn(self, s, z, mask)
 
 
 def _outer_product_mean_forward_clean(self, m, mask, chunk_size=None):
@@ -1084,7 +1173,8 @@ def apply_patches(
     # --- PairformerLayer ---
     if apply_pairformer:
         from boltz.model.layers.pairformer import PairformerLayer
-        PairformerLayer.forward = _pairformer_layer_forward_clean
+        PairformerLayer.forward = (_pairformer_layer_forward_fused if _LAYER_FUSE in ("tail", "pair")
+                                   else _pairformer_layer_forward_clean)
         installed["patches"].append("PairformerLayer.forward -> clean (no autocast, no .float())")
 
     # --- K-24 triangle attention (opt-in) ---

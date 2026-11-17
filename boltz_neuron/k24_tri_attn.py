@@ -200,13 +200,20 @@ def _is_outer_product(mask):
     return r[0]
 
 
-def forward(self, x, mask=None, chunk_size=None, use_kernels=False):
+def _res_wrap(fn):
+    def f(x, mask, *a):
+        return x + fn(x, mask, *a)
+    return f
+
+
+def forward(self, x, mask=None, chunk_size=None, use_kernels=False, residual=False):
     """Drop-in for TriangleAttention.forward on the neuron device (batch 1)."""
     if x.device.type != "neuron" or x.shape[0] != 1 or self.mha.linear_g is None:
         CALLS["fallback"] += 1
         if CALLS["fallback"] == 1:
             print(f"[boltz-neuron] K-24 tri-attn: stock fallback (device={x.device.type}, batch={x.shape[0]})", flush=True)
-        return self._k24_stock_forward(x, mask=mask, chunk_size=chunk_size, use_kernels=use_kernels)
+        o = self._k24_stock_forward(x, mask=mask, chunk_size=chunk_size, use_kernels=use_kernels)
+        return x + o if residual else o
     if mask is None:
         mask = x.new_ones(x.shape[:-1])
     elif not _is_outer_product(mask):
@@ -215,13 +222,14 @@ def forward(self, x, mask=None, chunk_size=None, use_kernels=False):
         CALLS["fallback"] += 1
         if CALLS["fallback"] == 1:
             print("[boltz-neuron] K-24 tri-attn: stock fallback (pair mask is not an outer product)", flush=True)
-        return self._k24_stock_forward(x, mask=mask, chunk_size=chunk_size, use_kernels=use_kernels)
+        o = self._k24_stock_forward(x, mask=mask, chunk_size=chunk_size, use_kernels=use_kernels)
+        return x + o if residual else o
     CALLS["k24"] += 1
-    key = (bool(self.starting), tuple(x.shape), x.dtype)
+    key = (bool(self.starting), tuple(x.shape), x.dtype, bool(residual))
     fn = _compiled.get(key)
     if fn is None:
-        fn = torch.compile(_forward_fn_v2 if _layout_for(bool(self.starting), x.shape[1]) == "v2" else _forward_fn,
-                           backend="neuron", fullgraph=True, dynamic=False)
+        base = _forward_fn_v2 if _layout_for(bool(self.starting), x.shape[1]) == "v2" else _forward_fn
+        fn = torch.compile(_res_wrap(base) if residual else base, backend="neuron", fullgraph=True, dynamic=False)
         _compiled[key] = fn
         print(f"[boltz-neuron] K-24 tri-attn: compiling graph starting={key[0]} shape={key[1]}", flush=True)
     mha = self.mha

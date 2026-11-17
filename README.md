@@ -209,6 +209,16 @@ structures/hour (it ran out of memory before). At 8
 samples the choice is within ~5%, so `--max_parallel_samples` is used as given. The noise is drawn for all samples
 up front, so the samples are the same; the outputs differ from the one-call run only by bf16 rounding.
 
+### Larger graphs per layer (default on trn2 at LNC=2, 2026-11-17)
+
+At LNC=2 small graphs speed up well under 2x and every launch synchronises the two physical cores. The package now
+runs the pair transition and the whole sequence stack of each Pairformer layer as one compiled graph, folds the
+residual adds into the neighbouring graphs, and joins the two triangle multiplications at their boundary
+(`BOLTZ_NEURON_LAYER_FUSE=pair`). One layer: 192 tokens 11.4 -> 8.8 ms, 384 tokens 29.8 -> 26.7 ms, 704 tokens 103.9
+-> 99.2 ms. Structures per hour, one device, 4 workers, no MSA: 8EIL ds=1 2,759 -> 3,258 (+18%), 8CPK ds=1 1,374 ->
+1,521 (+11%), ds=8 7,138 -> 7,695, ds=25 11,314 -> 12,109, 8CLZ ds=1 435 -> 456, ds=8 2,336 -> 2,449, ds=25 4,028 ->
+4,280. Accuracy is unchanged (5A7M 0.61 / 0.60 A, 3W7T 0.88 / 0.92 A, 3HTB ligand 0.27 A, 1BRS iRMSD 0.76 A).
+
 ### LNC=1: more throughput for small inputs, much smaller size limit (2026-11-16)
 
 `NEURON_LOGICAL_NC_CONFIG=1 BOLTZ_NEURON_LNC1_KERNELS=1` runs 8 workers of 12 GB per device instead of 4 of 24 GB.
@@ -434,6 +444,7 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_DROP_DISTO` | `1` | drop a training-only feature before it reaches the device |
 | `BOLTZ_NEURON_WRITER_CPU` | `1` | remove padding from outputs on CPU |
 | `BOLTZ_NEURON_UID_WRAP` | `1` | keep residue ids exact in bf16 above 256 residues |
+| `BOLTZ_NEURON_LAYER_FUSE` | `pair` on trn2 at LNC=2, else `0` | fewer, larger graphs per Pairformer layer: `tail` = pair transition + the whole sequence stack in one graph and the residual adds moved into neighbouring graphs; `pair` also fuses the two triangle multiplications' boundary. `0` = one graph per module |
 | `BOLTZ_NEURON_TRIMUL` | `split` on trn2 at LNC=2, else `eager` | triangle multiplication as a compiled prologue (LayerNorm, projections, gate) + one channel-major batched matmul + a compiled epilogue (1.4-1.6x per module at 384-704 tokens, 2.3x at 1,024; slightly closer to fp32). `eager` = op by op |
 | `BOLTZ_NEURON_K24_LAYOUT` | `auto` | `v2` projects q/k/v/g straight into the kernel's layout (no per-chunk copies; faster for the end node); `auto` uses it for the end node and for the start node from 1,024 tokens |
 | `BOLTZ_NEURON_FAST_SAMPLER` | unset | `1`: the diffusion sampler's per-step rigid alignment as one compiled graph + a CPU 3x3 SVD instead of ~30 tiny device ops (+2-4% structures/h at ds=1 below ~400 tokens, same results). `BOLTZ_NEURON_FAST_SAMPLER_AUG=1` also draws the random rotations on the CPU (+7% at 192 tokens, different random stream) |
