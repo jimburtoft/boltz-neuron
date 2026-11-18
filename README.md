@@ -185,10 +185,10 @@ unchanged (see [Accuracy](#accuracy)): 3W7T 0.88 / 0.92 A, 5A7M 0.61 / 0.60 A (t
 The kernels compile one graph per input size and module the first time: about 10-30 s at 384 tokens, 80 s at
 544, 110 s at 704, 220 s at 1,024 and 650 s at 1,408. The affinity module's pair mask (receptor x ligand) is not
 an outer product of a token mask, so its triangle attention keeps the stock path (logged once as "stock
-fallback"). The triangle attention and triangle multiplication are also published as a standalone Hugging Face
-Kernel Hub package,
+fallback"). The triangle attention, triangle multiplication and the larger layer graphs are also published as
+a standalone Hugging Face Kernel Hub package,
 [`jburtoft/triangle-attention-neuron-kernels`](https://huggingface.co/kernels/jburtoft/triangle-attention-neuron-kernels)
-(`get_kernel(..., version=1)`, `patch_boltz()`). The NKI Library code is licensed under the Apache License 2.0
+(1.2.0: `get_kernel(..., version=1)`, `patch_boltz()`; its Pairformer layer output is bit-identical to this package's). The NKI Library code is licensed under the Apache License 2.0
 (Copyright Amazon.com, Inc. or its affiliates); see the header of each vendored file.
 
 Opt-in extras: `BOLTZ_NEURON_FAST_SAMPLER=1` (the diffusion sampler's per-step rigid alignment as one graph +
