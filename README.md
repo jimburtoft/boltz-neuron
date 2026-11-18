@@ -6,7 +6,9 @@ Run **Boltz-2** biomolecular structure prediction on **AWS Inferentia2 (inf2)** 
 The package wraps the stock [`boltz`](https://github.com/jwohlwend/boltz) v2.2.1 (unchanged) and
 applies a validated configuration automatically when you run `python -m boltz_neuron`: bf16
 inference, a compiled diffusion model, sequence-length padding to fast shapes, caches that survive
-restarts, and the Inferentia2 fixes described in [NOTES.md](NOTES.md).
+restarts, and the Inferentia2 fixes described in [NOTES.md](NOTES.md). On Trainium2 it also replaces the
+Pairformer's triangle attention with an NKI kernel and restructures triangle multiplication and the layer's graphs,
+for 1.7-2.5x the throughput of the stock PyTorch path at one diffusion sample (see [Trainium2](#trainium2-trn2)).
 
 Runs on the public **AWS Neuron SDK 2.33** torch-neuronx DLAMI; no containers or private
 packages. Validated on **inf2.xlarge / inf2.8xlarge / inf2.24xlarge** (64-1,056 tokens per
@@ -60,7 +62,9 @@ compiler issue at LNC=2 (see [Trainium2](#trainium2-trn2)).
 
 The output is a standard Boltz-2 mmCIF structure plus confidence files in `out/`.
 
-**The prebuilt cache covers the example only** (186 tokens, `--diffusion_samples` 1, 8 or 25).
+**The prebuilt cache covers the example only** (186 tokens, `--diffusion_samples` 1, 8 or 25). On trn2 the v9 cache
+was built before the NKI triangle attention, split triangle multiplication and larger-graph defaults: it still
+speeds up the diffusion model, and the new trunk graphs compile on the first run (about 1-2 minutes at 186 tokens on a trn2.3xlarge).
 Other inputs compile on their first run, which needs more host RAM than an inf2.xlarge has; see
 [Building a cache](#building-a-cache-for-your-inputs).
 
@@ -147,107 +151,54 @@ At ~200 tokens the MSA adds about 3.6 s per prediction; above ~350 tokens it add
 Measured on a **trn2.3xlarge** (one Trainium2 device), Neuron SDK 2.33, same settings and method as
 the Inferentia2 tables. Default: **LNC=2**, 4 logical NeuronCores of 24 GB each, one worker per core.
 
-### NKI triangle attention (default on trn2 at LNC=2)
+### Throughput with the current defaults (2026-11-18)
 
-Triangle attention is 72-86% of the trunk's time on one trn2 core at 384-704 tokens. On trn2 at LNC=2 the
-package replaces its attention core with an NKI kernel (`boltz_neuron/k24_tri_attn.py`, built on a modified
-copy of the Neuron SDK's NKI Library `attention_cte`, vendored in `boltz_neuron/k24nkilib`).
-`BOLTZ_NEURON_TRI_ATTN=stock` turns it off. Measured 2026-11-07 (trn2.3xlarge, SDK 2.33):
+Structures per second per Trainium2 device (4 workers, LNC=2, no MSA, `--recycling_steps 3 --sampling_steps 50`,
+2 timed predictions per worker after a warm-up), boltz-neuron `2018cad` defaults. In brackets: the same input
+with the stock PyTorch paths (`BOLTZ_NEURON_TRI_ATTN=stock BOLTZ_NEURON_TRIMUL=eager BOLTZ_NEURON_LAYER_FUSE=0
+BOLTZ_FIX_MAX_PARALLEL_SAMPLES=0`, measured 2026-10-27):
 
-- **One module, one core, real Boltz-2 weights**: 1.8-1.9x faster than stock at 384 tokens, 2.7-3.0x at 544,
-  2.9-3.2x at 704, 3.5-3.7x at 1,024, 2.3-2.6x at 1,408. Its outputs are closer to fp32 than the stock bf16
-  path's (relative error 0.019-0.022 vs 0.023-0.026).
-- **Accuracy vs crystal** (MSA, two seeds): 3W7T 0.88 / 0.89 A (stock 0.92 / 0.88), 5A7M 0.61 / 0.61 A (stock
-  0.61 / 0.61), 6EA2 0.50 / 0.45 A (stock 0.48 / 0.50); lDDT-CA 0.980-0.996, the same as stock.
-- **Structures per second per device** (4 workers, no MSA):
+| input (tokens, padded) | ds=1 | ds=8 | ds=25 |
+|---|---:|---:|---:|
+| 8EIL (192) | **0.868** (0.500) | **4.82** | **7.51** (5.26) |
+| 8C4D (352) | **0.437** (0.229) | **2.26** (1.33) | **3.54** (1.96) |
+| 8CPK (384) | **0.422** (0.240) | **2.12** (1.33) | **3.36** (2.00) |
+| 8ARE (544) | **0.186** (0.083) | **0.966** (0.474) | **1.61** (0.922) |
+| 8GPP (640) | **0.149** (0.073) | | **1.33** (0.788) |
+| 8CLZ (704) | **0.127** (0.052) | **0.680** (0.311) | **1.19** (0.611) |
 
-| input (tokens, padded) | ds=1 stock -> NKI | ds=8 stock -> NKI | ds=25 stock -> NKI |
-|---|---|---|---|
-| 8EIL (192) | 0.50 -> **0.70** | | 5.26 -> **6.41** |
-| 8C4D (352) | 0.23 -> **0.34** | 1.33 -> **1.81** | 1.96 -> **2.42** |
-| 8CPK (384) | 0.24 -> **0.33** | 1.33 -> **1.70** | 2.00 -> **2.37** |
-| 8ARE (544) | 0.083 -> **0.156** | 0.47 -> **0.81** | 0.92 -> **1.46** * |
-| 8OWF (576) | 0.078 -> **0.149** | 0.45 -> **0.79** | 0.87 -> **1.39** * |
-| 7TPU (640) | 0.072 -> **0.131** | 0.41 -> **0.67** | 0.79 -> **1.18** * |
-| 8GPP (640) | 0.073 -> **0.131** | 0.42 -> **0.68** | 0.79 -> **1.22** * |
-| 8CLZ (704) | 0.052 -> **0.108** | 0.31 -> **0.58** | 0.61 -> **1.05** * |
+That is 1.7-2.5x the stock path at ds=1 and 1.4-2.2x at ds=8 and 25. Accuracy against crystal structures is
+unchanged (see [Accuracy](#accuracy)): 3W7T 0.88 / 0.92 A, 5A7M 0.61 / 0.60 A (two seeds, MSA), 3HTB ligand
+0.27 A, 1BRS interface 0.76 A.
 
-Complexes: 3HTB (protein + ligand, with affinity) protein 0.37 A, ligand 0.33 A (stock 0.27 / 0.34 A), affinity
--0.19 / P(binder) 0.40 (stock -0.22 / 0.44); 1BRS (protein-protein) interface RMSD 0.76 A (stock 0.79 A). The
-affinity module's pair mask (receptor x ligand) is not an outer product of a token mask, so its triangle
-attention keeps the stock path (logged once as "stock fallback"). The size limits are unchanged: they are set by
-device memory, not by triangle attention (1,440 tokens at ds=1 still runs out of memory).
+### What the package does on trn2 (all on by default at LNC=2)
 
-Since 2026-11-10 the kernel uses static DMA descriptors for its K/V/output transfers: 0.4-3.2% more structures per
-hour on top of the table above (8CPK ds=1 0.340, 8ARE ds=1 0.159, 8CLZ ds=1 0.111 / ds=8 0.586 / ds=25 1.075, 8EIL
-ds=25 6.44 structures/s), same predicted structures.
+| change | what it is | setting (off) |
+|---|---|---|
+| NKI triangle attention | triangle attention's core runs in an NKI kernel (a modified copy of the Neuron SDK's NKI Library `attention_cte`, vendored in `boltz_neuron/k24nkilib`): the per-head bias stays on chip and is added through a matmul. Per module 1.8-1.9x faster than stock at 384 tokens, 2.7-3.7x at 544-1,024, and closer to fp32 | `BOLTZ_NEURON_TRI_ATTN=stock` |
+| Split triangle multiplication | compiled LayerNorm + projections + gate, one batched matmul over the channels, compiled output norm + projection + gate: 1.4-1.6x per module (as one compiled graph it is 20-100x slower than op by op) | `BOLTZ_NEURON_TRIMUL=eager` |
+| Larger graphs per layer | the pair transition and the whole sequence stack of each Pairformer layer in one graph, residual adds folded into neighbouring graphs, the two triangle multiplications joined at their boundary: per layer 11.4 -> 8.8 ms at 192 tokens, 29.8 -> 26.7 ms at 384 | `BOLTZ_NEURON_LAYER_FUSE=0` |
+| Samples per diffusion call | at 16 or more samples, 5 samples per diffusion call from 288 tokens (one call of 25 spills the attention scores to device memory above ~300 tokens): +23-28% at 352-544 tokens x 25 samples, and 704 tokens x 25 samples fits | `BOLTZ_NEURON_AUTO_MPS=0` |
+| Chunked steering potentials | steering potentials run over the particles in chunks (exact), so NIM-style steering fits at 704 tokens x 25 samples | `BOLTZ_NEURON_POTENTIAL_CHUNK=<n>` |
+| LNC=2 accuracy fix | splits one diffusion-model graph that the compiler gets wrong at LNC=2 ([below](#lnc2-accuracy-fix)) | `BOLTZ_NEURON_ATOM_GRAPH_BREAK=0` |
 
-\* with `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1` (now the trn2 default). The kernel compiles one graph per input size and node (start/end)
-the first time: about 10-30 s at 384 tokens, 80 s at 544, 110 s at 704, 220 s at 1,024 and 650 s at 1,408. The
-latency tables below are stock (measured before the kernel).
-
-### Samples per diffusion call (default on trn2 at LNC=2)
-
-With `--diffusion_samples 25` stock Boltz runs all 25 samples through each diffusion step in one call. Above ~300
-tokens that call no longer fits on chip and the attention scores go through device memory. On trn2 the package
-now runs 5 samples per call for inputs of 288 tokens or more (at 16 samples or more) and the full batch below.
-Structures per hour, one device, 4 workers, 2026-11-11:
-
-| input (tokens, padded) | ds | all in one call (before) | 5 per call (now) | 1 per call |
-|---|---:|---:|---:|---:|
-| 8EIL (192) | 25 | **23,062** (kept) | 20,785 | 10,695 |
-| 8C4D (352) | 25 | 8,751 | **11,194** | |
-| 8CPK (384) | 25 | 8,551 | **10,490** | 8,962 |
-| 8ARE (544) | 25 | 4,526 | **5,414** | 4,830 |
-| 8CLZ (704) | 25 | out of memory | **3,818** | 3,528 |
-
-With the new defaults and no flags: 8EIL 22,727, 8C4D 10,616, 8CPK 10,280, 8CLZ 3,687 structures/hour.
-With steering (`BOLTZ_NEURON_STEERING=nim`), 8CLZ at 25 samples also needed the steering potentials split: they
-hold every pair of the ~5,400 atoms for all 75 samples x particles at once (5.7 GB for one tensor). They now run
-in chunks of particles (same results, checked to 0.0000 A): 8CLZ steered x 25 samples runs at 1,640
-structures/hour (it ran out of memory before). At 8
-samples the choice is within ~5%, so `--max_parallel_samples` is used as given. The noise is drawn for all samples
-up front, so the samples are the same; the outputs differ from the one-call run only by bf16 rounding.
-
-### Larger graphs per layer (default on trn2 at LNC=2, 2026-11-17)
-
-At LNC=2 small graphs speed up well under 2x and every launch synchronises the two physical cores. The package now
-runs the pair transition and the whole sequence stack of each Pairformer layer as one compiled graph, folds the
-residual adds into the neighbouring graphs, and joins the two triangle multiplications at their boundary
-(`BOLTZ_NEURON_LAYER_FUSE=pair`). One layer: 192 tokens 11.4 -> 8.8 ms, 384 tokens 29.8 -> 26.7 ms, 704 tokens 103.9
--> 99.2 ms. Structures per hour, one device, 4 workers, no MSA: 8EIL ds=1 2,759 -> 3,258 (+18%), 8CPK ds=1 1,374 ->
-1,521 (+11%), ds=8 7,138 -> 7,695, ds=25 11,314 -> 12,109, 8CLZ ds=1 435 -> 456, ds=8 2,336 -> 2,449, ds=25 4,028 ->
-4,280. Accuracy is unchanged (5A7M 0.61 / 0.60 A, 3W7T 0.88 / 0.92 A, 3HTB ligand 0.27 A, 1BRS iRMSD 0.76 A).
-
-### LNC=1: more throughput for small inputs, much smaller size limit (2026-11-16)
-
-`NEURON_LOGICAL_NC_CONFIG=1 BOLTZ_NEURON_LNC1_KERNELS=1` runs 8 workers of 12 GB per device instead of 4 of 24 GB.
-Structures per hour, one device, no MSA (LNC=2 -> LNC=1): 8EIL (192 tokens) ds=1 2,712 -> 3,466 (+28%), 8CPK (384)
-ds=1 1,375 -> 1,566 (+14%), ds=25 11,177 -> 12,999 (+16%), 8ARE (544) ds=1 +11%, 8CLZ (704) ds=1 +4%; 8CLZ x 25
-samples does not fit. **The size limit with all 8 workers busy falls to 736 / 736 / 544 tokens at 1 / 8 / 25 samples
-(LNC=2: 1,408 / 1,152 / 1,024), and MSA inputs fail earlier (760 tokens with an MSA did not fit).** Accuracy is the
-same (5A7M 0.61 A). Use it only for screening many small inputs; LNC=2 stays the default.
-
-### Triangle multiplication (default on trn2 at LNC=2, 2026-11-14)
-
-Triangle multiplication is about a quarter of the trunk. Compiled as one graph it is 20-100x slower than op by
-op; split at the contraction (compiled LayerNorm + projections + gate, one batched matmul over the 128 channels,
-compiled output norm + projection + gate) it is 1.4-1.6x faster than op by op per module (384 tokens 3.7 vs 5.3 ms,
-704 tokens 10.9 vs 15-17 ms, 1,024 tokens 20 vs 45-53 ms), with slightly lower error vs fp32. With it (and the
-triangle-attention layout change), structures per hour on one device (4 workers, no MSA), vs the K-25 kernel:
-8CPK ds=1 1,373 (1,223), 8ARE ds=1 636 (573), 8CLZ ds=1 436 (399) / ds=8 2,353 (2,110) / ds=25 4,028 (3,871),
-8EIL ds=25 24,357 (23,166), 8CPK ds=25 11,177 (10,280). Crystal-structure accuracy is unchanged (3W7T 0.89 / 0.90 A,
-5A7M 0.61 / 0.60 A, 6EA2 0.49 / 0.46 A).
-
-The same kernel, and since 1.1.0 the split triangle multiplication, is published as a standalone Hugging Face
+The kernels compile one graph per input size and module the first time: about 10-30 s at 384 tokens, 80 s at
+544, 110 s at 704, 220 s at 1,024 and 650 s at 1,408. The affinity module's pair mask (receptor x ligand) is not
+an outer product of a token mask, so its triangle attention keeps the stock path (logged once as "stock
+fallback"). The triangle attention and triangle multiplication are also published as a standalone Hugging Face
 Kernel Hub package,
 [`jburtoft/triangle-attention-neuron-kernels`](https://huggingface.co/kernels/jburtoft/triangle-attention-neuron-kernels)
-(`get_kernel(..., version=1)`, `patch_boltz()`), for use outside this package.
+(`get_kernel(..., version=1)`, `patch_boltz()`). The NKI Library code is licensed under the Apache License 2.0
+(Copyright Amazon.com, Inc. or its affiliates); see the header of each vendored file.
 
-The NKI Library code is licensed under the Apache License 2.0 (Copyright Amazon.com, Inc. or its affiliates);
-see the header of each vendored file.
+Opt-in extras: `BOLTZ_NEURON_FAST_SAMPLER=1` (the diffusion sampler's per-step rigid alignment as one graph +
+a CPU 3x3 SVD: +2-4% at ds=1 below ~400 tokens, same results) and `BOLTZ_NEURON_K24_BIAS=hilo` (triangle bias at
+~fp32 precision, ~7% slower, structures unchanged).
 
-### Latency: seconds per prediction, one logical NeuronCore (LNC=2)
+### Latency: seconds per prediction, one logical NeuronCore (LNC=2, stock paths, before the kernels)
+
+Measured 2026-10 with the stock PyTorch paths; with the current defaults the trunk is 1.7-2.5x faster (see the
+throughput table above).
 
 | tokens | ds=1 | ds=8 | ds=25 |
 |---:|---:|---:|---:|
@@ -262,7 +213,7 @@ see the header of each vendored file.
 | 1,024 | 201.8 | 258.1 |  |
 | 1,056 | 205.4 | 269.7 |  |
 
-### Throughput: structures per second per Trainium2 device (4 workers, LNC=2)
+### Throughput by size: structures per second per Trainium2 device (4 workers, LNC=2, stock paths)
 
 | tokens | ds=1 | ds=8 | ds=25 |
 |---:|---:|---:|---:|
@@ -327,17 +278,21 @@ after a warm-up; 2026-11-07):
 
 ### LNC=2 or LNC=1
 
-| tokens | single worker, LNC=2 / LNC=1 (s) | per device, LNC=2 / LNC=1 (structures/s, ds=1) |
-|---:|---|---|
-| 192 | 7.5 / 10.2 | 0.535 (4 workers) / 0.716 (8) |
-| 512 | 31.1 / 50.8 | 0.129 (4) / 0.142 (8) |
-| 640 | 54.6 / 94.9 | 0.073 (4) / 0.081 (8) |
-| 960 | 143.8 / 255.8 | 0.028 (4) / 0.016 (4) |
-| 1,056 | 205.4 / 366.7 | 0.019 (4) / 0.011 (4) |
+`NEURON_LOGICAL_NC_CONFIG=1 BOLTZ_NEURON_LNC1_KERNELS=1` runs 8 workers of 12 GB per device instead of 4 of 24 GB,
+with the same kernels. It gives more throughput only for small inputs, at a **severe cost in input size**:
 
-LNC=2 (default) has the lowest latency, the largest inputs and, from ~700 tokens, the most throughput.
-Up to 640 tokens, `NEURON_LOGICAL_NC_CONFIG=1` (8 workers) gives 6-58% more structures per second per
-device. Accuracy is the same at both settings (below). Caches are per LNC setting.
+| | LNC=2 (default) | LNC=1, 8 workers |
+|---|---|---|
+| 8EIL (192 tokens) ds=1, structures/s per device | 0.868 | 1.12 (with larger graphs) |
+| 8CPK (384) ds=1 | 0.422 | 0.455 |
+| 8CLZ (704) ds=1 | 0.127 | 0.126 (unfused) |
+| 8CLZ (704) ds=25 | 1.19 | does not fit |
+| **largest input, ds = 1 / 8 / 25** | **1,408 / 1,152 / 1,024 tokens** | **736 / 736 / 544 tokens** |
+
+Inputs with an MSA fail earlier at LNC=1 (a 760-token protein with its MSA does not fit). Accuracy is the same.
+Use LNC=1 only for screening many small inputs (up to ~500 tokens, little or no MSA). Every compiled graph splits
+evenly across the two physical cores at LNC=2; LNC=1 wins at small sizes because small graphs speed up less than 2x
+on two cores and every launch synchronises them. Caches are per LNC setting.
 
 ### LNC=2 accuracy fix
 
@@ -373,7 +328,9 @@ accuracy with no measurable speed cost: **0.61-0.92 Å, lDDT-CA 0.979-0.982** on
 - On SDK 2.33, two ~765-residue proteins with MSAs (PDB 3W7T, 5A7M; `--max_msa_seqs 2048`, padded
   to 832 tokens, seeds 0 and 1) match the crystal structures at 0.62-0.92 Å CA-RMSD (lDDT-CA
   0.981-0.983) on Inferentia2, the same as the Beta 5 build (0.54-0.90 Å, 0.982-0.986), and at
-  0.61-0.92 Å (lDDT-CA 0.979-0.983) on trn2 (LNC=2 with the fix, and LNC=1).
+  0.61-0.92 Å (lDDT-CA 0.979-0.983) on trn2 (LNC=2 with the fix, and LNC=1). With the current trn2 defaults
+  (NKI triangle attention, split triangle multiplication, larger graphs): 3W7T 0.88 / 0.92 Å, 5A7M 0.61 / 0.60 Å
+  (lDDT-CA 0.980-0.983); 6EA2 0.49 / 0.46 Å with the kernels.
 - ~890-residue proteins (PDB 6EA2, 3B34, MSA, padded 889/891 -> 928 tokens, seeds 0 and 1): 0.37-0.47 Å
   CA-RMSD (lDDT-CA 0.993-0.997) on Inferentia2 and 0.47-0.50 Å (0.991-0.996) on trn2, the same as the
   Beta 5 build (0.34-0.44 Å).
@@ -385,6 +342,9 @@ accuracy with no measurable speed cost: **0.61-0.92 Å, lDDT-CA 0.979-0.982** on
   | | affinity (log10 IC50 / P(binder)) | -0.21, -0.14 / 0.41, 0.40 | -0.22 / 0.44 | -0.31 / 0.45 |
   | 1M17, EGFR kinase + erlotinib | ligand RMSD | 0.79-0.82 Å | 0.92 Å | 0.98 Å |
   | 1BRS, barnase-barstar | interface RMSD | 0.77-0.80 Å | 0.79 Å | 0.77 Å |
+
+  With the current trn2 defaults: 3HTB ligand RMSD 0.27 Å, affinity -0.14 / P(binder) 0.40; 1BRS interface RMSD
+  0.76 Å.
 
   Protein CA-RMSD for 3HTB and 1BRS is 0.25-0.37 Å everywhere. For 1M17 the whole-chain CA-RMSD is
   ~11.8 Å on every platform including CPU fp32: the model places the C-terminal tail differently from
