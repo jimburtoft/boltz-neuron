@@ -97,6 +97,10 @@ if INSTANCE.startswith("trn2"):
         os.environ.setdefault("BOLTZ_NEURON_TRIMUL", "split")
         # K-31: fewer, larger graphs per Pairformer layer (layer tail + trimul pair fused). +5-18% structures/h.
         os.environ.setdefault("BOLTZ_NEURON_LAYER_FUSE", "pair")
+        # K-35: the diffusion sampler's per-step rigid alignment as one device graph (Horn quaternion, no 3x3 SVD,
+        # no host sync) + the sigma schedule on the host. +1.5-8% structures/h, accuracy unchanged.
+        # BOLTZ_NEURON_DEVICE_ALIGN=0 restores stock.
+        os.environ.setdefault("BOLTZ_NEURON_DEVICE_ALIGN", "1")
         # Samples per diffusion call (2026-11-11, folding-neuron K-27, DP=4 throughput): with all samples in
         # one call the score model spills the [samples*heads, N, N] attention scores to HBM once N >= ~320.
         # Default: max_parallel_samples is a real cap, and at ds >= 16 calls run 5 samples for N >= 288 tokens
@@ -523,8 +527,11 @@ def apply():
     _enable_aot_cache()
     import patches  # the shipped bf16 patch module
     patches.apply_load_patches()                       # torch.load weights_only=False + omegaconf
-    patches.apply_patches(dtype=_ACTIVE_DTYPE, compile_safe=COMPILE_STRUCTURE)  # bf16 + dtype-safe
+    _inst = patches.apply_patches(dtype=_ACTIVE_DTYPE, compile_safe=COMPILE_STRUCTURE)  # bf16 + dtype-safe
     _log(f"bf16 patches applied (dtype={DTYPE}, compile_safe={COMPILE_STRUCTURE})")
+    for _p in (_inst or {}).get("patches", []):
+        if "diffusion sampler" in _p:
+            _log(_p)
     _install_gen2_rng_shim()
     _install_pad_hook()
     _install_drop_disto_hook()

@@ -1249,7 +1249,11 @@ def apply_patches(
 
     if os.environ.get("BOLTZ_NEURON_STATIC_STEERING", "1") not in ("0", "false", "no") and _apply_flat_bottom_static_shape_patch():
         installed["patches"].append("FlatBottomPotential.compute_function -> torch.where (static shapes; bit-exact)")
-    if os.environ.get("BOLTZ_NEURON_FAST_SAMPLER", "0") == "1":
+    if os.environ.get("BOLTZ_NEURON_DEVICE_ALIGN", "0") == "1":
+        _da = _apply_device_align_patch()
+        if _da:
+            installed["patches"].append(f"diffusion sampler -> {_da} (BOLTZ_NEURON_DEVICE_ALIGN=1)")
+    elif os.environ.get("BOLTZ_NEURON_FAST_SAMPLER", "0") == "1":
         _fs = _apply_fast_sampler_helpers_patch()
         if _fs:
             installed["patches"].append(f"diffusion sampler helpers -> {_fs} (BOLTZ_NEURON_FAST_SAMPLER=1)")
@@ -1589,6 +1593,105 @@ def _apply_fast_sampler_helpers_patch():
             D.compute_random_augmentation = compute_random_augmentation
     L._bn_fast_align = True
     return "rigid-align: compiled reductions + CPU 3x3 SVD" + ("; random augmentation on CPU" if os.environ.get("BOLTZ_NEURON_FAST_SAMPLER_AUG", "0") == "1" else "")
+
+
+def _horn_rotation(H, nsq: int = 32):
+    """Optimal proper rotation for covariance H[b] = sum_n w p_n t_n^T (the stock weighted_rigid_align's
+    U diag(1,1,det) V^T), without an SVD: Horn's quaternion method. The rotation's quaternion is the top
+    eigenvector of a symmetric 4x4 matrix built from H; it is found by repeated squaring of the matrix shifted
+    to be positive semi-definite (Gershgorin bound), so the op count is fixed and everything is elementwise or a
+    small reduction -- one device graph, no host sync. det(R) = +1 by construction (no reflection case)."""
+    Sxx, Sxy, Sxz = H[:, 0, 0], H[:, 1, 0], H[:, 2, 0]
+    Syx, Syy, Syz = H[:, 0, 1], H[:, 1, 1], H[:, 2, 1]
+    Szx, Szy, Szz = H[:, 0, 2], H[:, 1, 2], H[:, 2, 2]
+    N = torch.stack([
+        torch.stack([Sxx + Syy + Szz, Syz - Szy, Szx - Sxz, Sxy - Syx], -1),
+        torch.stack([Syz - Szy, Sxx - Syy - Szz, Sxy + Syx, Szx + Sxz], -1),
+        torch.stack([Szx - Sxz, Sxy + Syx, -Sxx + Syy - Szz, Syz + Szy], -1),
+        torch.stack([Sxy - Syx, Szx + Sxz, Syz + Szy, -Sxx - Syy + Szz], -1)], -2)
+    eye = torch.eye(4, dtype=H.dtype, device=H.device)
+    diag = torch.diagonal(N, dim1=-2, dim2=-1)
+    c = (N.abs().sum(-1) - 2 * diag).amax(-1).clamp_min(0)
+    A = N + c[:, None, None] * eye
+    for _ in range(nsq):
+        A = A / (torch.diagonal(A, dim1=-2, dim2=-1).sum(-1)[:, None, None] + 1e-30)
+        A = (A.unsqueeze(-1) * A.unsqueeze(-3)).sum(-2)
+    d = torch.diagonal(A, dim1=-2, dim2=-1)
+    # column with the largest diagonal (A ~ v v^T): one-hot of the first maximum, no gather
+    first = torch.cumsum((d >= d.amax(-1, keepdim=True)).to(A.dtype), -1)
+    onehot = ((first == 1) & (d >= d.amax(-1, keepdim=True))).to(A.dtype)
+    v = (A * onehot[:, None, :]).sum(-1)
+    q = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-30)
+    r, i, j, k = q.unbind(-1)
+    return torch.stack([1 - 2 * (j * j + k * k), 2 * (i * j - k * r), 2 * (i * k + j * r),
+                        2 * (i * j + k * r), 1 - 2 * (i * i + k * k), 2 * (j * k - i * r),
+                        2 * (i * k - j * r), 2 * (j * k + i * r), 1 - 2 * (i * i + j * j)], -1).view(-1, 3, 3)
+
+
+def _apply_device_align_patch():
+    """K-35: the diffusion sampler's per-step rigid alignment as ONE device graph with no host sync, and the sigma
+    schedule on the host (so the three per-step .item() calls do not wait for the device queue).
+
+    Stock weighted_rigid_align runs ~30 tiny eager ops, a 3x3 SVD and two host-side checks (`torch.any(...)` /
+    `(S.abs() <= 1e-15).any()`, print-only warnings) every step; the K-30 opt-in still copied the 3x3 covariance
+    to the host. Here centroids, covariance, rotation (Horn quaternion, _horn_rotation) and the rotated coordinates
+    are one compiled fp32 graph. The rotation equals the SVD one to fp32 rounding (CPU check against fp64 SVD:
+    rel 1e-7..5e-6 on the coordinates, same as or below fp32 SVD's own error). The two warning prints are dropped.
+    BOLTZ_NEURON_DEVICE_ALIGN=0 restores stock."""
+    try:
+        import boltz.model.loss.diffusionv2 as L
+        import boltz.model.modules.diffusionv2 as D
+    except Exception:
+        return ""
+    if getattr(L, "_bn_device_align", False):
+        return "already"
+
+    def _align(true_coords, pred_coords, weights, mask):
+        w = (mask * weights).unsqueeze(-1)
+        ws = w.sum(dim=-2, keepdim=True)
+        tc = (true_coords * w).sum(dim=-2, keepdim=True) / ws
+        pc = (pred_coords * w).sum(dim=-2, keepdim=True) / ws
+        t0 = true_coords - tc
+        p0 = pred_coords - pc
+        H = ((w * p0).unsqueeze(-1) * t0.unsqueeze(-2)).sum(-3)
+        R = _horn_rotation(H)
+        return (t0.unsqueeze(-2) * R.unsqueeze(-3)).sum(-1) + pc
+
+    _c = {}
+    _orig_align = L.weighted_rigid_align
+
+    def weighted_rigid_align(true_coords, pred_coords, weights, mask):
+        if true_coords.device.type != "neuron" or true_coords.dim() != 3:
+            return _orig_align(true_coords, pred_coords, weights, mask)
+        f = _c.get("a")
+        if f is None:
+            f = _c["a"] = torch.compile(_align, backend="neuron", fullgraph=True, dynamic=False)
+        f32 = torch.float32
+        dt = true_coords.dtype
+        return f(true_coords.to(f32), pred_coords.to(f32), weights.to(f32), mask.to(f32)).to(dt)
+
+    L.weighted_rigid_align = weighted_rigid_align
+    if hasattr(D, "weighted_rigid_align"):
+        D.weighted_rigid_align = weighted_rigid_align
+
+    sched = ""
+    if os.environ.get("BOLTZ_NEURON_HOST_SCHEDULE", "1") == "1":
+        _orig_sched = D.AtomDiffusion.sample_schedule
+
+        def sample_schedule(self, num_sampling_steps=None):
+            if self.device.type != "neuron":
+                return _orig_sched(self, num_sampling_steps)
+            import torch.nn.functional as F
+            n = num_sampling_steps if num_sampling_steps is not None else self.num_sampling_steps
+            inv_rho = 1 / self.rho
+            steps = torch.arange(n, dtype=torch.float32)
+            s = (self.sigma_max ** inv_rho + steps / (n - 1) * (self.sigma_min ** inv_rho - self.sigma_max ** inv_rho)) ** self.rho
+            return F.pad(s * self.sigma_data, (0, 1), value=0.0)
+
+        D.AtomDiffusion.sample_schedule = sample_schedule
+        sched = "; sigma schedule on host"
+    L._bn_device_align = True
+    return "rigid-align: one device graph (Horn quaternion, no host sync)" + sched
 
 
 def _apply_potential_particle_chunk_patch():
