@@ -115,6 +115,8 @@ if INSTANCE.startswith("trn2"):
         os.environ.setdefault("BOLTZ_NEURON_TRI_ATTN", "k24")
         os.environ.setdefault("BOLTZ_NEURON_TRIMUL", "split")
         os.environ.setdefault("BOLTZ_NEURON_LAYER_FUSE", "pair")
+        # K-37: device-side rigid alignment at LNC=1 too: +1.0-6.8% structures/h (8 workers), accuracy unchanged
+        os.environ.setdefault("BOLTZ_NEURON_DEVICE_ALIGN", "1")
         os.environ.setdefault("BOLTZ_FIX_MAX_PARALLEL_SAMPLES", "1")
         if os.environ["BOLTZ_FIX_MAX_PARALLEL_SAMPLES"] == "1":
             os.environ.setdefault("BOLTZ_NEURON_AUTO_MPS", "1")

@@ -280,18 +280,21 @@ after a warm-up; 2026-11-07):
 ### LNC=2 or LNC=1
 
 `NEURON_LOGICAL_NC_CONFIG=1 BOLTZ_NEURON_LNC1_KERNELS=1` runs 8 workers of 12 GB per device instead of 4 of 24 GB,
-with the same kernels. It gives more throughput only for small inputs, at a **severe cost in input size**:
+with the same kernels and the device-side rigid alignment. It gives more throughput for small inputs and at ds=25
+up to ~400 tokens, at a **cost in input size** (measured 2026-11-21, structures/s per device, current defaults):
 
 | | LNC=2 (default) | LNC=1, 8 workers |
 |---|---|---|
-| 8EIL (192 tokens) ds=1, structures/s per device | 0.868 | 1.12 (with larger graphs) |
-| 8CPK (384) ds=1 | 0.422 | 0.455 |
-| 8CLZ (704) ds=1 | 0.127 | 0.126 (unfused) |
-| 8CLZ (704) ds=25 | 1.19 | does not fit |
-| **largest input, ds = 1 / 8 / 25** | **1,408 / 1,152 / 1,024 tokens** | **736 / 736 / 544 tokens** |
+| 8EIL (192 tokens) ds=1 | 0.939 | 1.11 (+18%) |
+| 8CPK (384) ds=1 | 0.433 | 0.468 (+8%) |
+| 8CLZ (704) ds=1 | 0.127 | 0.129 (+2%) |
+| 8EIL ds=25 | 7.72 | 7.91 (+2%) |
+| 8CPK ds=25 | 3.33 | 3.90 (+17%) |
+| 8CLZ (704) ds=25 | 1.18 | does not fit |
+| **largest input, ds = 1 / 8 / 25** (all 8 workers busy) | **1,408 / 1,152 / 1,024 tokens** | **736 / >= 736 / 576 tokens** (768 at ds=1 and 640 at ds=25 run out of memory) |
 
-Inputs with an MSA fail earlier at LNC=1 (a 760-token protein with its MSA does not fit). Accuracy is the same.
-Use LNC=1 only for screening many small inputs (up to ~500 tokens, little or no MSA). Every compiled graph splits
+The 760-token proteins 3W7T and 5A7M with their MSA (up to 2,048 sequences) fit on one LNC=1 worker; accuracy
+is the same as LNC=2. Use LNC=1 for screening many small inputs (up to ~500 tokens). Every compiled graph splits
 evenly across the two physical cores at LNC=2; LNC=1 wins at small sizes because small graphs speed up less than 2x
 on two cores and every launch synchronises them. Caches are per LNC setting.
 
@@ -408,7 +411,7 @@ Environment variables; the defaults are the validated configuration.
 | `BOLTZ_NEURON_LAYER_FUSE` | `pair` on trn2 at LNC=2, else `0` | fewer, larger graphs per Pairformer layer: `tail` = pair transition + the whole sequence stack in one graph and the residual adds moved into neighbouring graphs; `pair` also fuses the two triangle multiplications' boundary. `0` = one graph per module |
 | `BOLTZ_NEURON_TRIMUL` | `split` on trn2 at LNC=2, else `eager` | triangle multiplication as a compiled prologue (LayerNorm, projections, gate) + one channel-major batched matmul + a compiled epilogue (1.4-1.6x per module at 384-704 tokens, 2.3x at 1,024; slightly closer to fp32). `eager` = op by op |
 | `BOLTZ_NEURON_K24_LAYOUT` | `auto` | `v2` projects q/k/v/g straight into the kernel's layout (no per-chunk copies; faster for the end node); `auto` uses it for the end node and for the start node from 1,024 tokens |
-| `BOLTZ_NEURON_DEVICE_ALIGN` | `1` on trn2 at LNC=2, else unset | the diffusion sampler's rigid alignment as one device graph (Horn quaternion rotation, no SVD, no host sync) and the sigma schedule on the host. `0` = stock |
+| `BOLTZ_NEURON_DEVICE_ALIGN` | `1` on trn2 at LNC=2 and with `BOLTZ_NEURON_LNC1_KERNELS=1`, else unset | the diffusion sampler's rigid alignment as one device graph (Horn quaternion rotation, no SVD, no host sync) and the sigma schedule on the host. `0` = stock |
 | `BOLTZ_NEURON_FAST_SAMPLER` | unset | superseded by `BOLTZ_NEURON_DEVICE_ALIGN` (ignored while it is on). `1`: the diffusion sampler's per-step rigid alignment as one compiled graph + a CPU 3x3 SVD instead of ~30 tiny device ops (+2-4% structures/h at ds=1 below ~400 tokens, same results). `BOLTZ_NEURON_FAST_SAMPLER_AUG=1` also draws the random rotations on the CPU (+7% at 192 tokens, different random stream) |
 | `BOLTZ_NEURON_LNC1_KERNELS` | unset | with `NEURON_LOGICAL_NC_CONFIG=1`, also use the NKI triangle attention, split triangle multiplication and samples-per-call cap (otherwise LNC=1 runs the stock paths). See "LNC=1" below: more throughput for small inputs, much lower size limits |
 | `BOLTZ_FIX_MAX_PARALLEL_SAMPLES` | `1` on trn2 at LNC=2, else unset | `--max_parallel_samples` is a cap on samples per diffusion call (stock Boltz 2.2.1 computes `ds % mps + 1` chunks, so ds=25 with the default 5 runs all 25 in one call). `0` restores stock chunking |
