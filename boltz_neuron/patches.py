@@ -402,6 +402,72 @@ def _pairformer_layer_forward_fused(self, s, z, mask=None, pair_mask=None,
     return fn(self, s, z, mask)
 
 
+# --- K-38: MSA layer (opt-in BOLTZ_NEURON_MSA_FUSE=1; measured below noise, so not a default) ---
+# MSA transition compiled unchunked; PairformerNoSeqLayer through the K-28/K-31 split trimul pair path + K-24 + a
+# compiled pair transition. PWA and OPM stay stock: compiled they were slower (PWA 1.8-3.1x, OPM 1.0-1.2x at
+# S = 256-1,024), and a single PWA+transition+OPM graph made the MSA module 2.9x slower with a 2,048-deep MSA.
+# E2E (trn2.3xlarge LNC=2, DP=4): no MSA -0.2..+0.6%; 3W7T with MSA 47.3 -> 46.7 s; accuracy unchanged.
+_MSA_COMPILED = {}
+
+
+def _noseq_transition(z, n_w, n_b, f1, f2, f3):
+    import torch.nn.functional as F
+    x = F.layer_norm(z, (z.shape[-1],), n_w, n_b, 1e-5)
+    return z + F.linear(F.silu(F.linear(x, f1)) * F.linear(x, f2), f3)
+
+
+def _msa_transition_only(m, t_w, t_b, t1, t2, t3):
+    import torch.nn.functional as F
+    x = F.layer_norm(m, (m.shape[-1],), t_w, t_b, 1e-5)
+    return m + F.linear(F.silu(F.linear(x, t1)) * F.linear(x, t2), t3)
+
+
+def _msa_layer_forward_fused(self, z, m, token_mask, msa_mask, chunk_heads_pwa=False, chunk_size_transition_z=None,
+                             chunk_size_transition_msa=None, chunk_size_outer_product=None, chunk_size_tri_attn=None,
+                             use_kernels=False):
+    """K-38. Per piece, measured on trn2 at 768 tokens (S = MSA depth), ms:
+         PWA    S=1 3.8 eager vs 5.4 compiled; S=256 22 vs 40; S=1,024 47 vs 147  -> keep stock eager (chunked heads)
+         OPM    S=1 22 vs 20;  S=256 39 vs 39;  S=1,024 56 vs 67                 -> keep stock eager (chunked)
+         MSA transition S=256 8.5 vs 2.9; S=1,024 23 vs 8.9                      -> compiled, unchunked
+       Pair stack: PairformerNoSeqLayer through the K-28/K-31 split trimul pair path + K-24 + compiled transition."""
+    if z.device.type != "neuron" or z.dtype != torch.bfloat16:
+        return self._k38_stock_forward(z, m, token_mask, msa_mask, chunk_heads_pwa, chunk_size_transition_z,
+                                       chunk_size_transition_msa, chunk_size_outer_product, chunk_size_tri_attn,
+                                       use_kernels)
+    c = lambda f: torch.compile(f, backend="neuron", fullgraph=True, dynamic=False)
+    m = m + self.pair_weighted_averaging(m, z, token_mask, chunk_heads_pwa)
+    key = ("mtr", tuple(m.shape), m.dtype)
+    fm = _MSA_COMPILED.get(key)
+    if fm is None:
+        fm = _MSA_COMPILED[key] = c(_msa_transition_only)
+    tr = self.msa_transition
+    m = fm(m, tr.norm.weight, tr.norm.bias, tr.fc1.weight, tr.fc2.weight, tr.fc3.weight)
+    z = z + self.outer_product_mean(m, msa_mask, chunk_size_outer_product)
+    lay = self.pairformer_layer
+    if type(lay.tri_mul_out).forward is _tri_mul_out_forward_split and _LAYER_FUSE == "pair":
+        z = _tm_pair_forward(lay, z, token_mask)
+    else:
+        z = z + lay.tri_mul_out(z, mask=token_mask)
+        z = z + lay.tri_mul_in(z, mask=token_mask)
+    try:
+        from boltz_neuron import k24_tri_attn as _K
+        k24 = _K if getattr(type(lay.tri_att_start), "forward", None) is _K.forward else None
+    except Exception:
+        k24 = None
+    if k24 is not None:
+        z = k24.forward(lay.tri_att_start, z, mask=token_mask, residual=True)
+        z = k24.forward(lay.tri_att_end, z, mask=token_mask, residual=True)
+    else:
+        z = z + lay.tri_att_start(z, mask=token_mask, chunk_size=chunk_size_tri_attn)
+        z = z + lay.tri_att_end(z, mask=token_mask, chunk_size=chunk_size_tri_attn)
+    key = ("tr", tuple(z.shape), z.dtype)
+    ft = _MSA_COMPILED.get(key)
+    if ft is None:
+        ft = _MSA_COMPILED[key] = c(_noseq_transition)
+    t = lay.transition_z
+    return ft(z, t.norm.weight, t.norm.bias, t.fc1.weight, t.fc2.weight, t.fc3.weight), m
+
+
 def _outer_product_mean_forward_clean(self, m, mask, chunk_size=None):
     """Clean OuterProductMean.forward: no .float() cast on the outer-product einsum.
 
@@ -1185,6 +1251,14 @@ def apply_patches(
             TriangleAttention._k24_stock_forward = TriangleAttention.forward
             TriangleAttention.forward = k24_tri_attn.forward
         installed["patches"].append("TriangleAttention.forward -> K-24 NKI attention core (BOLTZ_NEURON_TRI_ATTN=k24)")
+
+    # --- K-38 MSA layer fusion (opt-in) ---
+    if os.environ.get("BOLTZ_NEURON_MSA_FUSE", "0") == "1" and dtype == torch.bfloat16:
+        from boltz.model.modules.trunkv2 import MSALayer
+        if not hasattr(MSALayer, "_k38_stock_forward"):
+            MSALayer._k38_stock_forward = MSALayer.forward
+            MSALayer.forward = _msa_layer_forward_fused
+        installed["patches"].append("MSALayer.forward -> compiled MSA transition + split pair stack (BOLTZ_NEURON_MSA_FUSE=1)")
 
     # --- OuterProductMean ---
     if apply_opm:
