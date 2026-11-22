@@ -18,7 +18,6 @@ omegaconf allowlist) and tolerates newer checkpoint kwargs.
 Optional, off by default:
   BOLTZ_TRIMUL_KCHUNK=<k>          split the triangle-multiplication contraction into k-sized chunks
   BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1 treat --max_parallel_samples as a per-chunk cap (default on trn2, see preamble)
-  BOLTZ_TRANSITION_Z_CHUNK=<n>     override the pair-transition chunk size (0 disables)
 """
 
 import os
@@ -301,23 +300,6 @@ def _attention_pair_bias_v2_forward_clean(self, s, z, mask, k_in, multiplicity=1
     return o
 
 
-def _transition_z_chunk_for(n_tokens: int):
-    """Chunk size for the pair transition, or None to leave it unchunked.
-
-    Mirrors upstream's own policy (64 when N > const.chunk_size_threshold), which
-    upstream computes and then fails to apply. BOLTZ_TRANSITION_Z_CHUNK overrides:
-    an int forces that chunk size at every N; "0" disables chunking entirely.
-    """
-    import os as _os
-    from boltz.data import const
-
-    _ov = _os.environ.get("BOLTZ_TRANSITION_Z_CHUNK", "")
-    if _ov:
-        v = int(_ov)
-        return v if v > 0 else None
-    return 64 if n_tokens > const.chunk_size_threshold else None
-
-
 def _pairformer_layer_forward_clean(self, s, z, mask=None, pair_mask=None,
                                      chunk_size_tri_attn=None, use_kernels=False,
                                      use_cuequiv_mul=False, use_cuequiv_attn=False):
@@ -332,8 +314,7 @@ def _pairformer_layer_forward_clean(self, s, z, mask=None, pair_mask=None,
                                 use_kernels=use_cuequiv_attn or use_kernels)
     z = z + self.tri_att_end(z, mask=pair_mask, chunk_size=chunk_size_tri_attn,
                               use_kernels=use_cuequiv_attn or use_kernels)
-    # Honor a pair-transition chunk if one is set on the layer; None -> stock behavior.
-    z = z + self.transition_z(z, getattr(self, "_m01_transition_z_chunk", None))
+    z = z + self.transition_z(z, None)
 
     # Sequence stack -- no autocast, no .float() casts.
     s_normed = self.pre_norm_s(s)
@@ -368,7 +349,7 @@ def _pairformer_layer_forward_fused(self, s, z, mask=None, pair_mask=None,
                                     chunk_size_tri_attn=None, use_kernels=False,
                                     use_cuequiv_mul=False, use_cuequiv_attn=False):
     """PairformerLayer.forward with the layer tail as one compiled graph (BOLTZ_NEURON_LAYER_FUSE=tail)."""
-    if z.device.type != "neuron" or getattr(self, "_m01_transition_z_chunk", None) is not None:
+    if z.device.type != "neuron":
         return _pairformer_layer_forward_clean(self, s, z, mask, pair_mask, chunk_size_tri_attn, use_kernels,
                                                use_cuequiv_mul, use_cuequiv_attn)
     tm_split = type(self.tri_mul_out).forward is _tri_mul_out_forward_split
