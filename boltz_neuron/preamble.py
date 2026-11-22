@@ -307,6 +307,11 @@ def _install_uid_wrap_hook():
     _log("ref_space_uid %256 wrap installed (exact same-residue mask in bf16)")
 
 
+_ASYNC_WRITE = os.environ.get("BOLTZ_NEURON_ASYNC_WRITE", "0") == "1"   # K-41
+_WRITE_POOL = None
+_PENDING = []
+
+
 def _install_writer_cpu_unpad():
     """WORKAROUND(nonzero-index): move each prediction to CPU before Boltz's writer unpads it.
 
@@ -338,10 +343,31 @@ def _install_writer_cpu_unpad():
         return x
 
     def _write(self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx):
-        return _orig(self, trainer, pl_module, _to_cpu(prediction), batch_indices, batch, batch_idx,
-                     dataloader_idx)
+        pred, bat = _to_cpu(prediction), batch
+        if not _ASYNC_WRITE:
+            return _orig(self, trainer, pl_module, pred, batch_indices, bat, batch_idx, dataloader_idx)
+        # K-41: format + write on one background thread while the next item predicts (the device->host copy above
+        # stays synchronous). One worker keeps the output order and the writer's counters single-threaded.
+        global _WRITE_POOL
+        if _WRITE_POOL is None:
+            import atexit
+            from concurrent.futures import ThreadPoolExecutor
+            _WRITE_POOL = ThreadPoolExecutor(max_workers=1)
+            atexit.register(_WRITE_POOL.shutdown, wait=True)
+        _PENDING.append(_WRITE_POOL.submit(_orig, self, trainer, pl_module, pred, batch_indices, bat, batch_idx,
+                                           dataloader_idx))
+        while len(_PENDING) > 2:          # bound host memory: at most 2 predictions queued
+            _PENDING.pop(0).result()
+
+    _orig_epoch_end = BoltzWriter.on_predict_epoch_end
+
+    def _epoch_end(self, trainer, pl_module):
+        while _PENDING:                   # drain before the failed-count summary is printed
+            _PENDING.pop(0).result()
+        return _orig_epoch_end(self, trainer, pl_module)
 
     BoltzWriter.write_on_batch_end = _write
+    BoltzWriter.on_predict_epoch_end = _epoch_end
 
 
 def _install_trainer_hook():
