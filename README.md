@@ -259,6 +259,8 @@ core).
 | **trn2, LNC=2, 4 workers per device** (all predictions succeed) | **1,408** | **1,152** (1,280: 2 of 4 workers fail) | **1,024** * (1,088: 1 of 4 workers fails on its 3rd prediction) |
 | trn2, LNC=1 (12 GB logical cores; one worker per HBM bank) | 1,280 (higher not tested) | 1,056 (higher not tested) | 960 (higher not tested) |
 
+> **Re-measurement pending (2026-11-22):** these ceilings were measured before the NKI triangle attention became the default. With the current defaults, one worker alone runs out of device memory at 1,408 tokens (ds=1) and 1,120 tokens (ds=25); with `BOLTZ_NEURON_TRI_ATTN=stock BOLTZ_NEURON_TRIMUL=eager BOLTZ_NEURON_LAYER_FUSE=0` the 1,408-token ds=1 case fits again. Updated limits will replace this table.
+
 "Fails" means the device memory runs out (`NRT_RESOURCE`). \* needs `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`
 (the trn2 default since 2026-11-11; without it the ds=25 limit is 960). trn2 limits measured 2026-11-07 on synthetic single chains in
 steps of 32 tokens, no MSA, steering off. Within ~10% of the limit, a worker sometimes runs out of
