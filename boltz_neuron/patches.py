@@ -383,6 +383,86 @@ def _pairformer_layer_forward_fused(self, s, z, mask=None, pair_mask=None,
     return fn(self, s, z, mask)
 
 
+# --- K-52: cross-layer graphs (BOLTZ_NEURON_XLAYER=1) ---
+# PairformerModule.forward with each layer's tail graph (pair transition + sequence stack) also running the NEXT
+# layer's trimul_out prologue (LN + projections + gate + channel-major copy): one fewer graph per layer and the
+# [N,N,128] z never round-trips to HBM between the two. Measured per 4 trunk layers (trn2 LNC=2, one core):
+# 192 tokens 33.2 -> 32.1 ms, 384 105.1 -> 102.3, 704 395.0 -> 383.2 (-2.7..-3.2%), same values up to bf16 order.
+_XLAYER_COMPILED = {}
+
+
+def _tail_plus_pro(s, z, mask, pm, w_tail, w_pro):
+    """layer tail (as _layer_tail) followed by the next layer's trimul_out prologue."""
+    lay_tail = w_tail
+    s2, z2 = _layer_tail(lay_tail, s, z, mask)
+    xn, a, b = _tm_prologue(z2, pm, *w_pro)
+    return s2, z2, xn, a, b
+
+
+def _is_split_trimul(mod):
+    # by name: preamble imports this file as top-level `patches`, so `boltz_neuron.patches` is a second module copy
+    # whose function objects differ from the installed ones
+    return getattr(type(mod).forward, "__name__", "") == "_tri_mul_out_forward_split"
+
+
+def _layer_pair_from_pro(lay, z, pm, xn, a, b):
+    """trimul_out (from a precomputed prologue) + trimul_in + both K-24 nodes, as in _pairformer_layer_forward_fused."""
+    to, ti = lay.tri_mul_out, lay.tri_mul_in
+    key = ("pairmid", tuple(z.shape), z.dtype)
+    fns = _TM_COMPILED.get(key)
+    if fns is None:
+        c = lambda f: torch.compile(f, backend="neuron", fullgraph=True, dynamic=False)
+        fns = _TM_COMPILED[key] = (c(_tm_mid), c(_tm_epilogue_res))
+    cm, ce = fns
+    o = torch.bmm(a, b.transpose(1, 2))
+    z, xn2, a2, b2 = cm(o, xn, to.norm_out.weight, to.norm_out.bias, to.p_out.weight, to.g_out.weight, z, pm,
+                        ti.norm_in.weight, ti.norm_in.bias, ti.p_in.weight, ti.g_in.weight)
+    o2 = torch.bmm(a2.transpose(1, 2), b2)
+    z = ce(o2, xn2, ti.norm_out.weight, ti.norm_out.bias, ti.p_out.weight, ti.g_out.weight, z)
+    from boltz_neuron import k24_tri_attn as _K
+    z = _K.forward(lay.tri_att_start, z, mask=pm, residual=True)
+    z = _K.forward(lay.tri_att_end, z, mask=pm, residual=True)
+    return z
+
+
+def _pairformer_module_forward_xlayer(self, s, z, mask, pair_mask, use_kernels=False):
+    layers = list(self.layers)
+    ok = (z.device.type == "neuron" and z.dtype == torch.bfloat16 and not self.training and _LAYER_FUSE == "pair"
+          and len(layers) > 1 and all(_is_split_trimul(l.tri_mul_out) for l in layers))
+    if ok:
+        try:
+            from boltz_neuron import k24_tri_attn as _K
+            ok = all(getattr(type(l.tri_att_start), "forward", None) is _K.forward for l in layers) and \
+                _K._is_outer_product(pair_mask)
+        except Exception:
+            ok = False
+    if not ok:
+        return self._k52_stock_forward(s, z, mask, pair_mask, use_kernels=use_kernels)
+    pm = pair_mask.to(z.dtype)
+    key = (tuple(z.shape), tuple(s.shape), z.dtype)
+    ftp = _XLAYER_COMPILED.get(key)
+    if ftp is None:
+        ftp = _XLAYER_COMPILED[key] = torch.compile(_tail_plus_pro, backend="neuron", fullgraph=True, dynamic=False)
+    pro_key = ("pro", tuple(z.shape), z.dtype)
+    fpro = _TM_COMPILED.get(pro_key)
+    if fpro is None:
+        fpro = _TM_COMPILED[pro_key] = torch.compile(_tm_prologue, backend="neuron", fullgraph=True, dynamic=False)
+    to0 = layers[0].tri_mul_out
+    xn, a, b = fpro(z, pm, to0.norm_in.weight, to0.norm_in.bias, to0.p_in.weight, to0.g_in.weight)
+    for i, lay in enumerate(layers):
+        z = _layer_pair_from_pro(lay, z, pm, xn, a, b)
+        if i + 1 < len(layers):
+            nt = layers[i + 1].tri_mul_out
+            s, z, xn, a, b = ftp(s, z, mask, pm, lay, (nt.norm_in.weight, nt.norm_in.bias, nt.p_in.weight, nt.g_in.weight))
+        else:
+            tkey = (tuple(z.shape), tuple(s.shape), z.dtype, type(lay.attention).__name__)
+            ft = _TAIL_COMPILED.get(tkey)
+            if ft is None:
+                ft = _TAIL_COMPILED[tkey] = torch.compile(_layer_tail, backend="neuron", fullgraph=True, dynamic=False)
+            s, z = ft(lay, s, z, mask)
+    return s, z
+
+
 # --- K-38: MSA layer (opt-in BOLTZ_NEURON_MSA_FUSE=1; measured below noise, so not a default) ---
 # MSA transition compiled unchunked; PairformerNoSeqLayer through the K-28/K-31 split trimul pair path + K-24 + a
 # compiled pair transition. PWA and OPM stay stock: compiled they were slower (PWA 1.8-3.1x, OPM 1.0-1.2x at
@@ -403,42 +483,68 @@ def _msa_transition_only(m, t_w, t_b, t1, t2, t3):
     return m + F.linear(F.silu(F.linear(x, t1)) * F.linear(x, t2), t3)
 
 
+def _msa_transition_only(m, t_w, t_b, t1, t2, t3):
+    import torch.nn.functional as F
+    x = F.layer_norm(m, (m.shape[-1],), t_w, t_b, 1e-5)
+    return m + F.linear(F.silu(F.linear(x, t1)) * F.linear(x, t2), t3)
+
+
+def _msa_mtr_opm_pro(m, z, msa_mask, pm, t_w, t_b, t1, t2, t3, o_w, o_b, o_a, o_bw, o_o, o_ob, ln_w, ln_b, w_p, w_g):
+    """K-52: MSA transition + OPM (unchunked, stock einsum form) + the pair stack's trimul_out prologue, one graph."""
+    import torch.nn.functional as F
+    m = _msa_transition_only(m, t_w, t_b, t1, t2, t3)
+    mk = msa_mask.unsqueeze(-1).to(m.dtype)
+    x = F.layer_norm(m, (m.shape[-1],), o_w, o_b, 1e-5)
+    a = F.linear(x, o_a) * mk
+    b = F.linear(x, o_bw) * mk
+    num = (mk[:, :, None, :, 0] * mk[:, :, :, None, 0]).sum(1).clamp(min=1).unsqueeze(-1)
+    op = torch.einsum("bsic,bsjd->bijcd", a, b).reshape(*a.shape[:1], a.shape[2], b.shape[2], -1)
+    z = z + F.linear((op / num).to(m.dtype), o_o, o_ob)
+    xn, ta, tb = _tm_prologue(z, pm, ln_w, ln_b, w_p, w_g)
+    return m, z, xn, ta, tb
+
+
 def _msa_layer_forward_fused(self, z, m, token_mask, msa_mask, chunk_heads_pwa=False, chunk_size_transition_z=None,
                              chunk_size_transition_msa=None, chunk_size_outer_product=None, chunk_size_tri_attn=None,
                              use_kernels=False):
-    """K-38. Per piece, measured on trn2 at 768 tokens (S = MSA depth), ms:
-         PWA    S=1 3.8 eager vs 5.4 compiled; S=256 22 vs 40; S=1,024 47 vs 147  -> keep stock eager (chunked heads)
-         OPM    S=1 22 vs 20;  S=256 39 vs 39;  S=1,024 56 vs 67                 -> keep stock eager (chunked)
-         MSA transition S=256 8.5 vs 2.9; S=1,024 23 vs 8.9                      -> compiled, unchunked
-       Pair stack: PairformerNoSeqLayer through the K-28/K-31 split trimul pair path + K-24 + compiled transition."""
+    """K-38 + K-52. Pair-weighted averaging stays stock eager (compiled it is 1.8-3.1x slower). Then ONE compiled
+    graph: MSA transition + outer product mean + the PairformerNoSeq trimul_out prologue (K-52: 7-17% faster per MSA
+    layer than stock at 192-768 tokens and MSA depth 1-1,024, except +3.5% at 384 x 256; rel vs fp32 unchanged).
+    Then the split trimul pair path, K-24 attention and a compiled pair transition."""
     if z.device.type != "neuron" or z.dtype != torch.bfloat16:
         return self._k38_stock_forward(z, m, token_mask, msa_mask, chunk_heads_pwa, chunk_size_transition_z,
                                        chunk_size_transition_msa, chunk_size_outer_product, chunk_size_tri_attn,
                                        use_kernels)
-    c = lambda f: torch.compile(f, backend="neuron", fullgraph=True, dynamic=False)
-    m = m + self.pair_weighted_averaging(m, z, token_mask, chunk_heads_pwa)
-    key = ("mtr", tuple(m.shape), m.dtype)
-    fm = _MSA_COMPILED.get(key)
-    if fm is None:
-        fm = _MSA_COMPILED[key] = c(_msa_transition_only)
-    tr = self.msa_transition
-    m = fm(m, tr.norm.weight, tr.norm.bias, tr.fc1.weight, tr.fc2.weight, tr.fc3.weight)
-    z = z + self.outer_product_mean(m, msa_mask, chunk_size_outer_product)
     lay = self.pairformer_layer
-    if type(lay.tri_mul_out).forward is _tri_mul_out_forward_split and _LAYER_FUSE == "pair":
-        z = _tm_pair_forward(lay, z, token_mask)
-    else:
-        z = z + lay.tri_mul_out(z, mask=token_mask)
-        z = z + lay.tri_mul_in(z, mask=token_mask)
     try:
         from boltz_neuron import k24_tri_attn as _K
         k24 = _K if getattr(type(lay.tri_att_start), "forward", None) is _K.forward else None
     except Exception:
         k24 = None
-    if k24 is not None:
-        z = k24.forward(lay.tri_att_start, z, mask=token_mask, residual=True)
-        z = k24.forward(lay.tri_att_end, z, mask=token_mask, residual=True)
+    c = lambda f: torch.compile(f, backend="neuron", fullgraph=True, dynamic=False)
+    m = m + self.pair_weighted_averaging(m, z, token_mask, chunk_heads_pwa)
+    pm = token_mask.to(z.dtype)
+    split = _is_split_trimul(lay.tri_mul_out) and _LAYER_FUSE == "pair" and k24 is not None
+    if split:
+        key = ("mop", tuple(z.shape), tuple(m.shape), z.dtype)
+        f = _MSA_COMPILED.get(key)
+        if f is None:
+            f = _MSA_COMPILED[key] = c(_msa_mtr_opm_pro)
+        tr, op, to = self.msa_transition, self.outer_product_mean, lay.tri_mul_out
+        m, z, xn, a, b = f(m, z, msa_mask, pm, tr.norm.weight, tr.norm.bias, tr.fc1.weight, tr.fc2.weight, tr.fc3.weight,
+                           op.norm.weight, op.norm.bias, op.proj_a.weight, op.proj_b.weight, op.proj_o.weight, op.proj_o.bias,
+                           to.norm_in.weight, to.norm_in.bias, to.p_in.weight, to.g_in.weight)
+        z = _layer_pair_from_pro(lay, z, pm, xn, a, b)
     else:
+        key = ("mtr", tuple(m.shape), m.dtype)
+        fm = _MSA_COMPILED.get(key)
+        if fm is None:
+            fm = _MSA_COMPILED[key] = c(_msa_transition_only)
+        tr = self.msa_transition
+        m = fm(m, tr.norm.weight, tr.norm.bias, tr.fc1.weight, tr.fc2.weight, tr.fc3.weight)
+        z = z + self.outer_product_mean(m, msa_mask, chunk_size_outer_product)
+        z = z + lay.tri_mul_out(z, mask=token_mask)
+        z = z + lay.tri_mul_in(z, mask=token_mask)
         z = z + lay.tri_att_start(z, mask=token_mask, chunk_size=chunk_size_tri_attn)
         z = z + lay.tri_att_end(z, mask=token_mask, chunk_size=chunk_size_tri_attn)
     key = ("tr", tuple(z.shape), z.dtype)
@@ -1232,6 +1338,14 @@ def apply_patches(
             TriangleAttention._k24_stock_forward = TriangleAttention.forward
             TriangleAttention.forward = k24_tri_attn.forward
         installed["patches"].append("TriangleAttention.forward -> K-24 NKI attention core (BOLTZ_NEURON_TRI_ATTN=k24)")
+
+    # --- K-52 cross-layer graphs (opt-in) ---
+    if os.environ.get("BOLTZ_NEURON_XLAYER", "0") == "1" and dtype == torch.bfloat16:
+        from boltz.model.layers.pairformer import PairformerModule
+        if not hasattr(PairformerModule, "_k52_stock_forward"):
+            PairformerModule._k52_stock_forward = PairformerModule.forward
+            PairformerModule.forward = _pairformer_module_forward_xlayer
+        installed["patches"].append("PairformerModule.forward -> layer tail + next layer's trimul prologue per graph (BOLTZ_NEURON_XLAYER=1)")
 
     # --- K-38 MSA layer fusion (opt-in) ---
     if os.environ.get("BOLTZ_NEURON_MSA_FUSE", "0") == "1" and dtype == torch.bfloat16:

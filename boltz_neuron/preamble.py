@@ -101,6 +101,11 @@ if INSTANCE.startswith("trn2"):
         # no host sync) + the sigma schedule on the host. +1.5-8% structures/h, accuracy unchanged.
         # BOLTZ_NEURON_DEVICE_ALIGN=0 restores stock.
         os.environ.setdefault("BOLTZ_NEURON_DEVICE_ALIGN", "1")
+        # K-52: graph partition search. Each trunk layer's tail graph also runs the next layer's triangle-multiplication
+        # prologue; the MSA layer's transition + outer product mean + pair prologue are one graph. Together +4.3-4.7%
+        # structures/h at ds=1 (192-704 tokens), +1.8% at ds=25, accuracy unchanged. =0 restores K-31/K-38 layout.
+        os.environ.setdefault("BOLTZ_NEURON_XLAYER", "1")
+        os.environ.setdefault("BOLTZ_NEURON_MSA_FUSE", "1")
         # Samples per diffusion call (2026-11-11, folding-neuron K-27, DP=4 throughput): with all samples in
         # one call the score model spills the [samples*heads, N, N] attention scores to HBM once N >= ~320.
         # Default: max_parallel_samples is a real cap, and at ds >= 16 calls run 5 samples for N >= 288 tokens
