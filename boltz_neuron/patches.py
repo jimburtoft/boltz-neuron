@@ -35,6 +35,7 @@ _ORIGINAL_TENSOR_FLOAT = torch.Tensor.float
 # A graph break between them restores accuracy at no measured speed cost. On by default only on trn2 at
 # LNC=2 (the preamble sets it); BOLTZ_NEURON_ATOM_GRAPH_BREAK=0/1 overrides.
 _ATOM_GRAPH_BREAK = os.environ.get("BOLTZ_NEURON_ATOM_GRAPH_BREAK", "0") == "1"
+_DROP_CONF_LOGITS = os.environ.get("BOLTZ_NEURON_DROP_CONF_LOGITS", "0") == "1"   # K-51 (preamble sets 1 on trn2)
 # Tested alternative, NOT sufficient on the real model: pass atom_to_token to the compiled graph already
 # as bf16 (the standalone repro passes with it, the real model is still wrong). Off by default.
 _PRECAST_A2T = os.environ.get("BOLTZ_NEURON_PRECAST_A2T", "0") == "1"
@@ -837,11 +838,30 @@ def _make_confidence_forward_dtype_safe(target_dtype: torch.dtype, original_forw
         if x_pred.dtype != target_dtype:
             x_pred = x_pred.to(target_dtype)
         # s, s_inputs, z should already be target_dtype (from trunk in bf16)
-        return original_forward(
+        if _DROP_CONF_LOGITS and run_sequentially and multiplicity > 1 and z.shape[0] == 1:
+            # K-51: stock's per-sample loop, dropping pae_logits / pde_logits ([1, N, N, 64] fp32 each) from every sample
+            # before concatenation. With 25 samples at 1,024 tokens the concatenated pde_logits alone are 3.4 GB and were
+            # the allocation that failed. Inference reads only the derived pae/pde/ptm/iptm (Boltz2.predict_step never
+            # returns the logits), so outputs are byte-identical.
+            outs = [_fwd(self, s_inputs, s, z, x_pred[i:i + 1], feats, pred_distogram_logits, multiplicity=1,
+                         run_sequentially=False, use_kernels=use_kernels) for i in range(multiplicity)]
+            out = {}
+            for k in outs[0]:
+                if k != "pair_chains_iptm":
+                    out[k] = torch.cat([o[k] for o in outs], dim=0)
+                else:
+                    out[k] = {c1: {c2: torch.cat([o[k][c1][c2] for o in outs], dim=0) for c2 in outs[0][k][c1]}
+                              for c1 in outs[0][k]}
+            return out
+        out = original_forward(
             self, s_inputs, s, z, x_pred, feats, pred_distogram_logits,
             multiplicity=multiplicity, run_sequentially=run_sequentially,
             use_kernels=use_kernels,
         )
+        if _DROP_CONF_LOGITS and isinstance(out, dict):
+            for k in ("pae_logits", "pde_logits"):
+                out.pop(k, None)
+        return out
     return _fwd
 
 

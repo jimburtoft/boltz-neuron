@@ -106,6 +106,9 @@ if INSTANCE.startswith("trn2"):
         # structures/h at ds=1 (192-704 tokens), +1.8% at ds=25, accuracy unchanged. =0 restores K-31/K-38 layout.
         os.environ.setdefault("BOLTZ_NEURON_XLAYER", "1")
         os.environ.setdefault("BOLTZ_NEURON_MSA_FUSE", "1")
+        # K-51: do not keep the confidence module's pae/pde logits (unused at inference; 3.4 GB at 1,024 tokens x 25
+        # samples). Restores the 25-sample size limit (1,120 tokens on one core). Outputs byte-identical.
+        os.environ.setdefault("BOLTZ_NEURON_DROP_CONF_LOGITS", "1")
         # Samples per diffusion call (2026-11-11, folding-neuron K-27, DP=4 throughput): with all samples in
         # one call the score model spills the [samples*heads, N, N] attention scores to HBM once N >= ~320.
         # Default: max_parallel_samples is a real cap, and at ds >= 16 calls run 5 samples for N >= 288 tokens
