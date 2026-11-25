@@ -35,6 +35,14 @@ _ORIGINAL_TENSOR_FLOAT = torch.Tensor.float
 # A graph break between them restores accuracy at no measured speed cost. On by default only on trn2 at
 # LNC=2 (the preamble sets it); BOLTZ_NEURON_ATOM_GRAPH_BREAK=0/1 overrides.
 _ATOM_GRAPH_BREAK = os.environ.get("BOLTZ_NEURON_ATOM_GRAPH_BREAK", "0") == "1"
+# K-54: above this many tokens (pair tensor side), every fast trunk path (split triangle multiplication, K-24
+# attention, fused layer / cross-layer / MSA graphs) steps aside for the stock op-by-op path, which keeps fewer large
+# intermediates live: one 24 GB core then fits 1,408 tokens at 1 sample instead of 1,152. 0 = off.
+_STOCK_ABOVE_N = int(os.environ.get("BOLTZ_NEURON_STOCK_ABOVE_N", "0"))
+
+
+def _big(x):
+    return _STOCK_ABOVE_N > 0 and x.dim() >= 3 and x.shape[-2] > _STOCK_ABOVE_N
 _DROP_CONF_LOGITS = os.environ.get("BOLTZ_NEURON_DROP_CONF_LOGITS", "0") == "1"   # K-51 (preamble sets 1 on trn2)
 # Tested alternative, NOT sufficient on the real model: pass atom_to_token to the compiled graph already
 # as bf16 (the standalone repro passes with it, the real model is still wrong). Off by default.
@@ -136,6 +144,9 @@ def _tm_pair_forward(lay, z, mask):
 
 
 def _tm_split_forward(self, x, mask, outgoing, residual=False):
+    if x.device.type == "neuron" and _big(x):
+        o = (_tri_mul_out_forward_clean if outgoing else _tri_mul_in_forward_clean)(self, x, mask)
+        return x + o if residual else o
     if x.device.type != "neuron":
         return (_tri_mul_out_forward_clean if outgoing else _tri_mul_in_forward_clean)(self, x, mask)
     key = (tuple(x.shape), x.dtype, bool(residual))
@@ -350,7 +361,7 @@ def _pairformer_layer_forward_fused(self, s, z, mask=None, pair_mask=None,
                                     chunk_size_tri_attn=None, use_kernels=False,
                                     use_cuequiv_mul=False, use_cuequiv_attn=False):
     """PairformerLayer.forward with the layer tail as one compiled graph (BOLTZ_NEURON_LAYER_FUSE=tail)."""
-    if z.device.type != "neuron":
+    if z.device.type != "neuron" or _big(z):
         return _pairformer_layer_forward_clean(self, s, z, mask, pair_mask, chunk_size_tri_attn, use_kernels,
                                                use_cuequiv_mul, use_cuequiv_attn)
     tm_split = type(self.tri_mul_out).forward is _tri_mul_out_forward_split
@@ -429,6 +440,7 @@ def _layer_pair_from_pro(lay, z, pm, xn, a, b):
 def _pairformer_module_forward_xlayer(self, s, z, mask, pair_mask, use_kernels=False):
     layers = list(self.layers)
     ok = (z.device.type == "neuron" and z.dtype == torch.bfloat16 and not self.training and _LAYER_FUSE == "pair"
+          and not _big(z)
           and len(layers) > 1 and all(_is_split_trimul(l.tri_mul_out) for l in layers))
     if ok:
         try:
@@ -512,7 +524,7 @@ def _msa_layer_forward_fused(self, z, m, token_mask, msa_mask, chunk_heads_pwa=F
     graph: MSA transition + outer product mean + the PairformerNoSeq trimul_out prologue (K-52: 7-17% faster per MSA
     layer than stock at 192-768 tokens and MSA depth 1-1,024, except +3.5% at 384 x 256; rel vs fp32 unchanged).
     Then the split trimul pair path, K-24 attention and a compiled pair transition."""
-    if z.device.type != "neuron" or z.dtype != torch.bfloat16:
+    if z.device.type != "neuron" or z.dtype != torch.bfloat16 or _big(z):
         return self._k38_stock_forward(z, m, token_mask, msa_mask, chunk_heads_pwa, chunk_size_transition_z,
                                        chunk_size_transition_msa, chunk_size_outer_product, chunk_size_tri_attn,
                                        use_kernels)

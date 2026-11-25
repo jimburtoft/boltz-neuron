@@ -109,6 +109,10 @@ if INSTANCE.startswith("trn2"):
         # K-51: do not keep the confidence module's pae/pde logits (unused at inference; 3.4 GB at 1,024 tokens x 25
         # samples). Restores the 25-sample size limit (1,120 tokens on one core). Outputs byte-identical.
         os.environ.setdefault("BOLTZ_NEURON_DROP_CONF_LOGITS", "1")
+        # K-54: above 1,152 tokens the trunk uses the stock op-by-op layers (fewer large tensors live): one core fits
+        # 1,408 tokens at 1 sample and 1,312 at 8 again (1,152 / 1,152 on the fast layers). Same results at or below
+        # 1,152 (byte-identical). BOLTZ_NEURON_STOCK_ABOVE_N=0 disables.
+        os.environ.setdefault("BOLTZ_NEURON_STOCK_ABOVE_N", "1152")
         # Samples per diffusion call (2026-11-11, folding-neuron K-27, DP=4 throughput): with all samples in
         # one call the score model spills the [samples*heads, N, N] attention scores to HBM once N >= ~320.
         # Default: max_parallel_samples is a real cap, and at ds >= 16 calls run 5 samples for N >= 288 tokens

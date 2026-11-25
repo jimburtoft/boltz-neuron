@@ -206,8 +206,14 @@ def _res_wrap(fn):
     return f
 
 
+_STOCK_ABOVE_N = int(os.environ.get("BOLTZ_NEURON_STOCK_ABOVE_N", "0"))   # K-54, see patches.py
+
+
 def forward(self, x, mask=None, chunk_size=None, use_kernels=False, residual=False):
     """Drop-in for TriangleAttention.forward on the neuron device (batch 1)."""
+    if _STOCK_ABOVE_N and x.shape[-2] > _STOCK_ABOVE_N:
+        o = self._k24_stock_forward(x, mask=mask, chunk_size=chunk_size if chunk_size else 128, use_kernels=use_kernels)
+        return x + o if residual else o
     if x.device.type != "neuron" or x.shape[0] != 1 or self.mha.linear_g is None:
         CALLS["fallback"] += 1
         if CALLS["fallback"] == 1:
