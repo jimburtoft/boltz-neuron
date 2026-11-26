@@ -260,7 +260,7 @@ core).
 | **trn2, LNC=2, 4 workers per device** (all predictions succeed) | **1,408** | **1,152** (1,280: 2 of 4 workers fail) | **1,024** * (1,088: 1 of 4 workers fails on its 3rd prediction) |
 | trn2, LNC=1 (12 GB logical cores; one worker per HBM bank) | 1,280 (higher not tested) | 1,056 (higher not tested) | 960 (higher not tested) |
 
-> **Current defaults (measured 2026-11-25, synthetic single chain, no MSA):** one worker alone: 1 sample **1,408** tokens (1,440 fails), 8 samples **1,312**, 25 samples **1,120**. Four workers per device, all predictions succeeding: 1 sample **1,280** (1,344: 4 of 8 fail; 1,408: 2 of 8 fail), 8 samples **1,216**, 25 samples **1,088**. Inputs above 1,152 tokens run the trunk on the stock layers (`BOLTZ_NEURON_STOCK_ABOVE_N=1152`, slower but fits); at or below 1,152 nothing changes.
+> **Current defaults (measured 2026-11-25/26, synthetic single chain, no MSA):** per 24 GB logical core: 1 sample **1,280** tokens reliably; 1,344 and 1,408 fit but are at the edge of device memory and fail on about 1 in 4 processes (1,440 always fails). 8 samples **1,216** (1,312 passed alone, not repeated), 25 samples **1,088** (1,120 passed alone). Running 4 workers per device does not lower these: each core's HBM is separate, and 4 parallel workers failed no more often than one core alone (K-54 follow-up). Inputs above 1,152 tokens run the trunk on the stock layers (`BOLTZ_NEURON_STOCK_ABOVE_N=1152`, slower but fits); at or below 1,152 nothing changes.
 
 "Fails" means the device memory runs out (`NRT_RESOURCE`). \* needs `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`
 (the trn2 default since 2026-11-11; without it the ds=25 limit is 960). trn2 limits measured 2026-11-07 on synthetic single chains in
