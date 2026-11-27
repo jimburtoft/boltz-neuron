@@ -261,6 +261,8 @@ core).
 | trn2, LNC=1 (12 GB logical cores; one worker per HBM bank) | 1,280 (higher not tested) | 1,056 (higher not tested) | 960 (higher not tested) |
 
 > **Current defaults (measured 2026-11-25/26, synthetic single chain, no MSA):** per 24 GB logical core: 1 sample **1,280** tokens reliably; 1,344 and 1,408 fit but are at the edge of device memory and fail on about 1 in 4 processes (1,440 always fails). 8 samples **1,216** (1,312 passed alone, not repeated), 25 samples **1,088** (1,120 passed alone). Running 4 workers per device does not lower these: each core's HBM is separate, and 4 parallel workers failed no more often than one core alone (K-54 follow-up). Inputs above 1,152 tokens run the trunk on the stock layers (`BOLTZ_NEURON_STOCK_ABOVE_N=1152`, slower but fits); at or below 1,152 nothing changes.
+>
+> **With an MSA** (measured 2026-11-27, 1 sample, one core): MSA depth 2,048 sequences: 1,024 tokens reliably (1,152 fails; 1,216 passes on the stock layers; 1,280 1 of 3). Depth 4,096: 832 tokens. Depth 8,192 (the Boltz default `--max_msa_seqs`): **576 tokens** (640 fails). For larger proteins, lower `--max_msa_seqs`.
 
 "Fails" means the device memory runs out (`NRT_RESOURCE`). \* needs `BOLTZ_FIX_MAX_PARALLEL_SAMPLES=1`
 (the trn2 default since 2026-11-11; without it the ds=25 limit is 960). trn2 limits measured 2026-11-07 on synthetic single chains in
