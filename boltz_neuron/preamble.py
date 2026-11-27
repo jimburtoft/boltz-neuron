@@ -113,6 +113,11 @@ if INSTANCE.startswith("trn2"):
         # 1,408 tokens at 1 sample and 1,312 at 8 again (1,152 / 1,152 on the fast layers). Same results at or below
         # 1,152 (byte-identical). BOLTZ_NEURON_STOCK_ABOVE_N=0 disables.
         os.environ.setdefault("BOLTZ_NEURON_STOCK_ABOVE_N", "1152")
+        # K-56: with an MSA (>= 256 sequences) the fast path fits less: stock layers above 512 tokens, and the outer
+        # product mean in 4-channel chunks above 512 tokens. One core then fits depth 2,048 x 1,216, 4,096 x 1,152,
+        # 8,192 (Boltz default) x 1,024 tokens (was 1,024 / 832 / 576). No change without an MSA or at <= 512 tokens.
+        os.environ.setdefault("BOLTZ_NEURON_STOCK_ABOVE_N_MSA", "512")
+        os.environ.setdefault("BOLTZ_NEURON_OPM_CHUNK", "4")
         # Samples per diffusion call (2026-11-11, folding-neuron K-27, DP=4 throughput): with all samples in
         # one call the score model spills the [samples*heads, N, N] attention scores to HBM once N >= ~320.
         # Default: max_parallel_samples is a real cap, and at ds >= 16 calls run 5 samples for N >= 288 tokens

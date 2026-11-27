@@ -41,8 +41,28 @@ _ATOM_GRAPH_BREAK = os.environ.get("BOLTZ_NEURON_ATOM_GRAPH_BREAK", "0") == "1"
 _STOCK_ABOVE_N = int(os.environ.get("BOLTZ_NEURON_STOCK_ABOVE_N", "0"))
 
 
+# K-56: with an MSA the fast path fits less (K-55: depth 2,048 fails at 1,152 tokens on the fast path, passes at
+# 1,216 on the stock path). BOLTZ_NEURON_STOCK_ABOVE_N_MSA=<n> applies instead when the current prediction's MSA depth
+# is >= BOLTZ_NEURON_STOCK_MSA_DEPTH (MSAModule.forward records the depth for the prediction).
+_STOCK_ABOVE_N_MSA = int(os.environ.get("BOLTZ_NEURON_STOCK_ABOVE_N_MSA", "0"))
+_STOCK_MSA_DEPTH = int(os.environ.get("BOLTZ_NEURON_STOCK_MSA_DEPTH", "256"))
+# K-56: OuterProductMean in hidden-channel chunks (stock's chunk_size_outer_product path) above this many tokens:
+# the unchunked [N, N, 1024] intermediate is the allocation that fails at MSA depth >= 4,096. Only with an MSA
+# (depth >= BOLTZ_NEURON_STOCK_MSA_DEPTH), so inputs without an MSA are unchanged.
+_OPM_CHUNK = int(os.environ.get("BOLTZ_NEURON_OPM_CHUNK", "0"))
+_OPM_CHUNK_MIN_N = int(os.environ.get("BOLTZ_NEURON_OPM_CHUNK_MIN_N", "512"))
+_CUR_MSA_DEPTH = [0]
+
+
+def _stock_threshold():
+    if _STOCK_ABOVE_N_MSA > 0 and _CUR_MSA_DEPTH[0] >= _STOCK_MSA_DEPTH:
+        return _STOCK_ABOVE_N_MSA
+    return _STOCK_ABOVE_N
+
+
 def _big(x):
-    return _STOCK_ABOVE_N > 0 and x.dim() >= 3 and x.shape[-2] > _STOCK_ABOVE_N
+    t = _stock_threshold()
+    return t > 0 and x.dim() >= 3 and x.shape[-2] > t
 _DROP_CONF_LOGITS = os.environ.get("BOLTZ_NEURON_DROP_CONF_LOGITS", "0") == "1"   # K-51 (preamble sets 1 on trn2)
 # Tested alternative, NOT sufficient on the real model: pass atom_to_token to the compiled graph already
 # as bf16 (the standalone repro passes with it, the real model is still wrong). Off by default.
@@ -583,6 +603,9 @@ def _outer_product_mean_forward_clean(self, m, mask, chunk_size=None):
     a = self.proj_a(m) * mask
     b = self.proj_b(m) * mask
 
+    if (chunk_size is None and _OPM_CHUNK and m.device.type == "neuron" and m.shape[2] > _OPM_CHUNK_MIN_N
+            and _CUR_MSA_DEPTH[0] >= _STOCK_MSA_DEPTH):
+        chunk_size = _OPM_CHUNK   # K-56: stock chunking (4 of 32 hidden channels at a time) at large N
     if chunk_size is not None and not self.training:
         # Chunked branch: original code (no defensive .float(), already dtype-consistent)
         for i in range(0, mask.shape[1], 64):
@@ -1370,6 +1393,21 @@ def apply_patches(
             TriangleAttention._k24_stock_forward = TriangleAttention.forward
             TriangleAttention.forward = k24_tri_attn.forward
         installed["patches"].append("TriangleAttention.forward -> K-24 NKI attention core (BOLTZ_NEURON_TRI_ATTN=k24)")
+
+    # --- K-56 record the MSA depth of the current prediction (for the depth-aware stock threshold) ---
+    try:
+        from boltz.model.modules.trunkv2 import MSAModule
+        if not hasattr(MSAModule, "_k56_orig_forward"):
+            MSAModule._k56_orig_forward = MSAModule.forward
+
+            def _msa_module_forward_depth(self, z, emb, feats, use_kernels=False):
+                msa = feats.get("msa")
+                _CUR_MSA_DEPTH[0] = int(msa.shape[1]) if msa is not None and msa.dim() >= 2 else 0
+                return MSAModule._k56_orig_forward(self, z, emb, feats, use_kernels=use_kernels)
+
+            MSAModule.forward = _msa_module_forward_depth
+    except Exception:
+        pass
 
     # --- K-52 cross-layer graphs (opt-in) ---
     if os.environ.get("BOLTZ_NEURON_XLAYER", "0") == "1" and dtype == torch.bfloat16:
