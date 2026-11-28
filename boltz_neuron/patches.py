@@ -54,8 +54,18 @@ _OPM_CHUNK_MIN_N = int(os.environ.get("BOLTZ_NEURON_OPM_CHUNK_MIN_N", "512"))
 _CUR_MSA_DEPTH = [0]
 
 
+# K-57: the stock layers are 2.1-2.3x slower than the fast path where the fast path fits (depth 2,048: 640 tokens
+# 56.5 vs 26.4 s, 768 tokens 106.5 vs 45.8 s), so the low threshold applies only to deep MSAs.
+# BOLTZ_NEURON_STOCK_ABOVE_N_MSA_DEEP=<n> for depth >= BOLTZ_NEURON_STOCK_MSA_DEPTH_DEEP; STOCK_ABOVE_N_MSA below that.
+_STOCK_ABOVE_N_MSA_DEEP = int(os.environ.get("BOLTZ_NEURON_STOCK_ABOVE_N_MSA_DEEP", "0"))
+_STOCK_MSA_DEPTH_DEEP = int(os.environ.get("BOLTZ_NEURON_STOCK_MSA_DEPTH_DEEP", "4096"))
+
+
 def _stock_threshold():
-    if _STOCK_ABOVE_N_MSA > 0 and _CUR_MSA_DEPTH[0] >= _STOCK_MSA_DEPTH:
+    d = _CUR_MSA_DEPTH[0]
+    if _STOCK_ABOVE_N_MSA_DEEP > 0 and d >= _STOCK_MSA_DEPTH_DEEP:
+        return _STOCK_ABOVE_N_MSA_DEEP
+    if _STOCK_ABOVE_N_MSA > 0 and d >= _STOCK_MSA_DEPTH:
         return _STOCK_ABOVE_N_MSA
     return _STOCK_ABOVE_N
 
